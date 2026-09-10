@@ -13,7 +13,7 @@
       <div class="brand-row">
         <div class="brand">
           <span class="brand-dot"></span>
-          <span>Note</span>
+          <span class="brand-copy"><strong>Note</strong><small>KNOWLEDGE WORKSPACE</small></span>
         </div>
         <button id="newBtn" class="icon-btn primary" title="新建笔记" aria-label="新建笔记">
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -49,8 +49,14 @@
     <main class="workspace">
       <header class="topbar">
         <div class="doc-title-wrap">
-          <input id="titleInput" class="doc-title" value="" placeholder="未命名笔记" />
-          <div id="saveState" class="save-state">已保存</div>
+          <div class="doc-title-stack">
+            <input id="titleInput" class="doc-title" value="" placeholder="未命名笔记" />
+            <div class="doc-subline">
+              <div id="saveState" class="save-state">已保存</div>
+              <span class="doc-subline-sep" aria-hidden="true"></span>
+              <div id="docMeta" class="doc-meta">RICH · 0 字 · LOCAL</div>
+            </div>
+          </div>
         </div>
         <div class="top-actions">
           <select id="folderSelect" class="folder-select" title="移动到目录">
