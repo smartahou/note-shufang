@@ -1,0 +1,24 @@
+Note + 书房 v1.10.0 本地域名配置
+================================
+
+1. 以管理员权限打开：
+   C:\Windows\System32\drivers\etc\hosts
+
+2. 加入：
+
+127.0.0.1 xn--uvz335a.com    # 笔记.com
+127.0.0.1 xn--1jqt79b.com    # 书房.com
+
+3. 保存后运行：
+
+node start
+
+4. 浏览器访问：
+
+http://笔记.com
+http://书房.com
+
+说明：
+- 中文域名在 DNS/hosts 层使用 Punycode 最稳定。
+- hosts 只映射域名到 127.0.0.1；node start 自带 80 端口入口，负责转发到 Note:3030 / 书房:39271。
+- 如果 80 端口被 IIS / Apache / Nginx 等占用，需要先释放。

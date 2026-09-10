@@ -1,0 +1,11 @@
+V12 数据安全修复
+
+1. 笔记和图片不再保存在程序目录。
+2. Windows 默认保存在 %LOCALAPPDATA%\Note。
+3. 程序目录可直接覆盖升级，不会覆盖用户数据。
+4. 首次运行自动迁移旧版 data/notes.json 和 uploads/。
+5. 每次写入前自动备份 notes.json，保留最近 30 份。
+6. 新版压缩包不再包含 data/notes.json 或 uploads/。
+
+重要：
+如果旧版 notes.json 已经被覆盖为空文件，本程序无法从空文件恢复已经被覆盖的数据。

@@ -1,0 +1,1964 @@
+const express = require('express');
+const multer = require('multer');
+const { marked } = require('marked');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const os = require('os');
+const { exec } = require('child_process');
+
+const app = express();
+const ROOT = __dirname;
+
+function resolveStorageRoot() {
+  if (process.env.NOTE_DATA_DIR) {
+    return path.resolve(process.env.NOTE_DATA_DIR);
+  }
+
+  if (process.platform === 'win32') {
+    const base =
+      process.env.LOCALAPPDATA ||
+      process.env.APPDATA ||
+      os.homedir();
+
+    return path.join(base, 'Note');
+  }
+
+  if (process.platform === 'darwin') {
+    return path.join(
+      os.homedir(),
+      'Library',
+      'Application Support',
+      'Note'
+    );
+  }
+
+  const xdg =
+    process.env.XDG_DATA_HOME ||
+    path.join(os.homedir(), '.local', 'share');
+
+  return path.join(xdg, 'note');
+}
+
+const STORAGE_ROOT = resolveStorageRoot();
+const DATA_DIR = path.join(STORAGE_ROOT, 'data');
+const UPLOAD_DIR = path.join(STORAGE_ROOT, 'uploads');
+const BACKUP_DIR = path.join(STORAGE_ROOT, 'backups');
+const DB_FILE = path.join(DATA_DIR, 'notes.json');
+const FOLDERS_FILE = path.join(DATA_DIR, 'folders.json');
+const FOLDERS_PREVIOUS_FILE = `${FOLDERS_FILE}.previous`;
+const LOCK_SESSION_TTL_MS = 30 * 60 * 1000;
+const LOCK_SCRYPT_N = 1 << 15;
+const LOCK_SCRYPT_R = 8;
+const LOCK_SCRYPT_P = 1;
+
+
+const PORT = Number(process.env.NOTE_PORT || process.env.PORT || 3030);
+const HOST = process.env.HOST || '127.0.0.1';
+const SHUFANG_SERVER_STATE_FILE = path.join(os.homedir(), '.shufang', 'server.json');
+
+fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+fs.mkdirSync(BACKUP_DIR, { recursive: true });
+
+function readJsonArray(file) {
+  try {
+    if (!fs.existsSync(file)) return null;
+
+    const parsed = JSON.parse(
+      fs.readFileSync(file, 'utf8') || '[]'
+    );
+
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function noteFingerprint(note) {
+  const identity = note?.locked
+    ? {
+        locked: true,
+        id: String(note?.id || ''),
+        ciphertext: String(note?.encryption?.ciphertext || '')
+      }
+    : {
+        title: String(note?.title || ''),
+        type: String(note?.type || ''),
+        content: String(note?.content || ''),
+        folderId: String(note?.folderId || '')
+      };
+
+  return crypto
+    .createHash('sha1')
+    .update(JSON.stringify(identity))
+    .digest('hex');
+}
+
+const QUARANTINE_DIR = path.join(STORAGE_ROOT, 'quarantine');
+const CLEANUP_MARKER_FILE = path.join(STORAGE_ROOT, '.cleanup-v1.2.json');
+const DB_PREVIOUS_FILE = `${DB_FILE}.previous`;
+const RECOVERY_REPORT_FILE = path.join(STORAGE_ROOT, 'recovery-report.json');
+
+fs.mkdirSync(QUARANTINE_DIR, { recursive: true });
+
+function timestampForFile() {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+function compareUpdatedAt(a, b) {
+  return String(a?.updatedAt || '').localeCompare(String(b?.updatedAt || ''));
+}
+
+function isRecoveryCopy(note) {
+  const title = String(note?.title || '').trim();
+  return /(?:（|\()\s*恢复副本\s*(?:）|\))\s*$/u.test(title);
+}
+
+function sanitizeNotes(list) {
+  const source = Array.isArray(list) ? list : [];
+  const stats = {
+    input: source.length,
+    invalid: 0,
+    recoveryCopies: 0,
+    duplicateIds: 0,
+    exactDuplicates: 0
+  };
+
+  // IDs are authoritative for one logical note. If polluted data contains the
+  // same ID more than once, retain the most recently updated version only.
+  const byId = new Map();
+  const withoutRecoveryCopies = [];
+
+  for (const note of source) {
+    if (!note || typeof note !== 'object' || Array.isArray(note)) {
+      stats.invalid += 1;
+      continue;
+    }
+
+    if (isRecoveryCopy(note)) {
+      stats.recoveryCopies += 1;
+      continue;
+    }
+
+    const id = typeof note.id === 'string' ? note.id.trim() : '';
+
+    if (!id) {
+      withoutRecoveryCopies.push(note);
+      continue;
+    }
+
+    const existing = byId.get(id);
+
+    if (!existing) {
+      byId.set(id, note);
+      continue;
+    }
+
+    stats.duplicateIds += 1;
+
+    if (compareUpdatedAt(note, existing) > 0) {
+      byId.set(id, note);
+    }
+  }
+
+  withoutRecoveryCopies.push(...byId.values());
+
+  // Remove only byte-for-byte logical duplicates (same title/type/content).
+  // We intentionally do NOT deduplicate merely-similar notes.
+  const byFingerprint = new Map();
+
+  for (const note of withoutRecoveryCopies) {
+    const fp = noteFingerprint(note);
+    const existing = byFingerprint.get(fp);
+
+    if (!existing) {
+      byFingerprint.set(fp, note);
+      continue;
+    }
+
+    stats.exactDuplicates += 1;
+
+    if (compareUpdatedAt(note, existing) > 0) {
+      byFingerprint.set(fp, note);
+    }
+  }
+
+  const notes = [...byFingerprint.values()];
+
+  stats.output = notes.length;
+  stats.removed = stats.input - stats.output;
+
+  return { notes, stats };
+}
+
+function writeDbDirect(notes) {
+  const payload = JSON.stringify(notes, null, 2);
+  const tmp = `${DB_FILE}.tmp-init-${process.pid}-${Date.now()}`;
+
+  fs.writeFileSync(tmp, payload, 'utf8');
+
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      fs.unlinkSync(DB_FILE);
+    }
+    fs.renameSync(tmp, DB_FILE);
+  } catch (error) {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {}
+    throw error;
+  }
+}
+
+function quarantineFile(file, targetDir, preferredName = null) {
+  if (!fs.existsSync(file)) return null;
+
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  const base = preferredName || path.basename(file);
+  let target = path.join(targetDir, base);
+  let i = 1;
+
+  while (fs.existsSync(target)) {
+    const ext = path.extname(base);
+    const stem = ext ? base.slice(0, -ext.length) : base;
+    target = path.join(targetDir, `${stem}-${i}${ext}`);
+    i += 1;
+  }
+
+  try {
+    fs.renameSync(file, target);
+  } catch {
+    fs.copyFileSync(file, target);
+    fs.unlinkSync(file);
+  }
+
+  return target;
+}
+
+function quarantineLegacyRecoveryState(cleanupDir) {
+  const moved = [];
+
+  if (fs.existsSync(BACKUP_DIR)) {
+    const backupTarget = path.join(cleanupDir, 'legacy-backups');
+
+    for (const name of fs.readdirSync(BACKUP_DIR)) {
+      const file = path.join(BACKUP_DIR, name);
+      let stat;
+
+      try {
+        stat = fs.statSync(file);
+      } catch {
+        continue;
+      }
+
+      if (!stat.isFile()) continue;
+      const target = quarantineFile(file, backupTarget);
+      if (target) moved.push(target);
+    }
+  }
+
+  if (fs.existsSync(RECOVERY_REPORT_FILE)) {
+    const target = quarantineFile(
+      RECOVERY_REPORT_FILE,
+      cleanupDir,
+      'legacy-recovery-report.json'
+    );
+    if (target) moved.push(target);
+  }
+
+  return moved;
+}
+
+function restoreInterruptedWriteIfNeeded() {
+  const current = readJsonArray(DB_FILE);
+
+  if (Array.isArray(current)) {
+    // A leftover previous file only means a prior write completed but cleanup
+    // was interrupted. The canonical DB wins.
+    if (fs.existsSync(DB_PREVIOUS_FILE)) {
+      try { fs.unlinkSync(DB_PREVIOUS_FILE); } catch {}
+    }
+    return current;
+  }
+
+  const previous = readJsonArray(DB_PREVIOUS_FILE);
+
+  if (Array.isArray(previous)) {
+    const stamp = timestampForFile();
+
+    if (fs.existsSync(DB_FILE)) {
+      try {
+        quarantineFile(
+          DB_FILE,
+          QUARANTINE_DIR,
+          `corrupt-notes-${stamp}.json`
+        );
+      } catch {}
+    }
+
+    fs.renameSync(DB_PREVIOUS_FILE, DB_FILE);
+    return previous;
+  }
+
+  return null;
+}
+
+function runOneTimeCleanup(current) {
+  if (fs.existsSync(CLEANUP_MARKER_FILE)) {
+    return current;
+  }
+
+  const stamp = timestampForFile();
+  const cleanupDir = path.join(QUARANTINE_DIR, `cleanup-v1.2-${stamp}`);
+  fs.mkdirSync(cleanupDir, { recursive: true });
+
+  // Preserve the exact pre-cleanup DB outside every active recovery path.
+  if (fs.existsSync(DB_FILE)) {
+    fs.copyFileSync(DB_FILE, path.join(cleanupDir, 'notes-before-cleanup.json'));
+  }
+
+  const movedLegacyFiles = quarantineLegacyRecoveryState(cleanupDir);
+  const cleaned = sanitizeNotes(current);
+
+  if (cleaned.stats.removed > 0 || !fs.existsSync(DB_FILE)) {
+    writeDbDirect(cleaned.notes);
+  }
+
+  const report = {
+    time: new Date().toISOString(),
+    mode: 'v1.2-active-data-cleanup',
+    stats: cleaned.stats,
+    quarantinedLegacyFiles: movedLegacyFiles,
+    quarantineDir: cleanupDir,
+    note: 'Quarantine is never scanned or auto-restored by the application.'
+  };
+
+  fs.writeFileSync(
+    path.join(cleanupDir, 'cleanup-report.json'),
+    JSON.stringify(report, null, 2),
+    'utf8'
+  );
+
+  fs.writeFileSync(
+    CLEANUP_MARKER_FILE,
+    JSON.stringify(report, null, 2),
+    'utf8'
+  );
+
+  if (cleaned.stats.removed > 0 || movedLegacyFiles.length > 0) {
+    console.log(
+      `  数据清理：移除 ${cleaned.stats.removed} 条脏笔记，隔离 ${movedLegacyFiles.length} 个旧恢复文件。`
+    );
+  }
+
+  return cleaned.notes;
+}
+
+function initializeStorage() {
+  let current = restoreInterruptedWriteIfNeeded();
+
+  if (!Array.isArray(current)) {
+    const stamp = timestampForFile();
+
+    // Do NOT scan backups, adjacent folders or old recovery reports here.
+    // A missing/corrupt DB is never a signal to merge historical snapshots.
+    if (fs.existsSync(DB_FILE)) {
+      try {
+        quarantineFile(
+          DB_FILE,
+          QUARANTINE_DIR,
+          `unreadable-notes-${stamp}.json`
+        );
+      } catch {}
+    }
+
+    current = [];
+    writeDbDirect(current);
+  }
+
+  current = runOneTimeCleanup(current);
+
+  // Self-heal on every startup. This is deliberately narrow: only the exact
+  // artifacts produced by the old recovery bug plus exact duplicates / ID
+  // collisions are removed. It never merges any historical source.
+  const cleaned = sanitizeNotes(current);
+
+  if (cleaned.stats.removed > 0) {
+    const stamp = timestampForFile();
+    const dir = path.join(QUARANTINE_DIR, `startup-sanitize-${stamp}`);
+    fs.mkdirSync(dir, { recursive: true });
+
+    if (fs.existsSync(DB_FILE)) {
+      fs.copyFileSync(DB_FILE, path.join(dir, 'notes-before-sanitize.json'));
+    }
+
+    writeDbDirect(cleaned.notes);
+
+    fs.writeFileSync(
+      path.join(dir, 'sanitize-report.json'),
+      JSON.stringify({
+        time: new Date().toISOString(),
+        stats: cleaned.stats
+      }, null, 2),
+      'utf8'
+    );
+
+    console.log(`  启动校验：清理 ${cleaned.stats.removed} 条异常记录。`);
+  }
+}
+
+initializeStorage();
+if (!fs.existsSync(FOLDERS_FILE) && fs.existsSync(FOLDERS_PREVIOUS_FILE)) {
+  try { fs.renameSync(FOLDERS_PREVIOUS_FILE, FOLDERS_FILE); } catch {}
+}
+if (!fs.existsSync(FOLDERS_FILE)) writeFolders([]);
+
+function repairOrphanFolderIds() {
+  const valid = new Set(readFolders().map(folder => folder.id));
+  const notes = readNotes();
+  let changed = false;
+  for (const note of notes) {
+    if (note.folderId && !valid.has(note.folderId)) {
+      note.folderId = null;
+      changed = true;
+    }
+  }
+  if (changed) {
+    writeNotes(notes);
+    console.log('  目录校验：已将失效目录中的笔记移回根目录。');
+  }
+}
+
+repairOrphanFolderIds();
+
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+app.use('/uploads', express.static(UPLOAD_DIR, {
+  maxAge: '7d',
+  fallthrough: false
+}));
+app.use(express.static(path.join(ROOT, 'public')));
+
+const realtimeClients = new Map();
+
+function requestClientId(req) {
+  return String(req.get('X-Note-Client-Id') || '').trim().slice(0, 120);
+}
+
+function noteMeta(note) {
+  if (!note || typeof note !== 'object') return null;
+  if (note.locked) return lockedNoteMeta(note);
+  const { content, encryption, ...meta } = note;
+  return meta;
+}
+
+function broadcastNoteEvent(payload = {}) {
+  const event = {
+    id: crypto.randomUUID(),
+    time: new Date().toISOString(),
+    ...payload
+  };
+  const chunk = `event: note\ndata: ${JSON.stringify(event)}\n\n`;
+
+  for (const [id, client] of realtimeClients) {
+    try {
+      client.write(chunk);
+    } catch {
+      realtimeClients.delete(id);
+    }
+  }
+}
+
+app.get('/api/events', (req, res) => {
+  const id = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+  const clientId = String(req.query.clientId || '').trim().slice(0, 120);
+
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders?.();
+  res.write(`retry: 1500\nevent: ready\ndata: ${JSON.stringify({ clientId })}\n\n`);
+
+  realtimeClients.set(id, res);
+  const heartbeat = setInterval(() => {
+    try { res.write(`: ping ${Date.now()}\n\n`); } catch {}
+  }, 20000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    realtimeClients.delete(id);
+  });
+});
+
+function readNotes() {
+  try {
+    const raw = fs.readFileSync(DB_FILE, 'utf8');
+    const list = JSON.parse(raw || '[]');
+    if (!Array.isArray(list)) return [];
+    return list.map(note => ({
+      ...note,
+      folderId: typeof note?.folderId === 'string' && note.folderId ? note.folderId : null,
+      locked: note?.locked === true
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function backupNotesFile() {
+  try {
+    if (!fs.existsSync(DB_FILE)) return;
+
+    const current = readJsonArray(DB_FILE);
+
+    if (!Array.isArray(current) || current.length === 0) {
+      return;
+    }
+
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, '-');
+
+    const backupFile = path.join(
+      BACKUP_DIR,
+      `notes-${stamp}.json`
+    );
+
+    fs.copyFileSync(DB_FILE, backupFile);
+
+    // Keep the newest 30 automatic backups.
+    const backups = fs
+      .readdirSync(BACKUP_DIR)
+      .filter(name => /^notes-.*\.json$/i.test(name))
+      .map(name => ({
+        name,
+        file: path.join(BACKUP_DIR, name),
+        time: fs.statSync(path.join(BACKUP_DIR, name)).mtimeMs
+      }))
+      .sort((a, b) => b.time - a.time);
+
+    for (const old of backups.slice(30)) {
+      try {
+        fs.unlinkSync(old.file);
+      } catch {}
+    }
+  } catch (error) {
+    console.warn('Backup warning:', error.message);
+  }
+}
+
+function writeNotes(notes, { skipBackup = false } = {}) {
+  const cleaned = sanitizeNotes(notes).notes;
+
+  // Backups remain available for manual inspection only. They are never
+  // scanned or auto-restored at startup. Locking skips the pre-write backup
+  // so plaintext is not copied immediately before encryption.
+  if (!skipBackup) backupNotesFile();
+
+  const tmp = `${DB_FILE}.tmp-${process.pid}-${Date.now()}`;
+  const payload = JSON.stringify(cleaned, null, 2);
+  let movedCurrent = false;
+
+  fs.writeFileSync(tmp, payload, 'utf8');
+
+  try {
+    // Keep one transactional predecessor so a crash between two renames can
+    // be repaired without touching historical backup snapshots.
+    if (fs.existsSync(DB_PREVIOUS_FILE)) {
+      fs.unlinkSync(DB_PREVIOUS_FILE);
+    }
+
+    if (fs.existsSync(DB_FILE)) {
+      fs.renameSync(DB_FILE, DB_PREVIOUS_FILE);
+      movedCurrent = true;
+    }
+
+    fs.renameSync(tmp, DB_FILE);
+
+    if (fs.existsSync(DB_PREVIOUS_FILE)) {
+      fs.unlinkSync(DB_PREVIOUS_FILE);
+    }
+  } catch (error) {
+    try {
+      if (!fs.existsSync(DB_FILE) && movedCurrent && fs.existsSync(DB_PREVIOUS_FILE)) {
+        fs.renameSync(DB_PREVIOUS_FILE, DB_FILE);
+      }
+    } catch {}
+
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {}
+
+    throw error;
+  }
+}
+
+function summaryOf(content = '') {
+  return content
+    .replace(/```[\s\S]*?```/g, ' code ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/[#>*_`~\-[\]()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 130);
+}
+
+
+function escapeHtmlAttr(value = '') {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+function safeHttpOrigin(value, fallback = 'http://127.0.0.1:39271') {
+  try {
+    const url = new URL(String(value || ''));
+    if (!/^https?:$/.test(url.protocol)) return fallback;
+    return url.origin;
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeCropString(value = '') {
+  const parts = String(value || '').split(',').map(Number);
+  if (parts.length !== 4 || parts.some(v => !Number.isFinite(v))) return '';
+  const [x, y, w, h] = parts;
+  if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > 1.001 || y + h > 1.001) return '';
+  return parts.map(v => Math.max(0, Math.min(1, v)).toFixed(6)).join(',');
+}
+
+function shufangCaptureMarkup({ imageUrl, bookHash, bookTitle, page, totalPages, relativePath, crop, shufangOrigin, mode }) {
+  const id = `img-${crypto.randomUUID()}`;
+  const safeHash = /^[a-f0-9]{64}$/i.test(String(bookHash || '')) ? String(bookHash).toLowerCase() : '';
+  const safePage = Math.max(1, Math.floor(Number(page) || 1));
+  const safeTotal = Math.max(0, Math.floor(Number(totalPages) || 0));
+  const safeCrop = normalizeCropString(crop);
+  const origin = safeHttpOrigin(shufangOrigin);
+  const title = String(bookTitle || '未命名书籍').slice(0, 300);
+  const rel = String(relativePath || '').slice(0, 1000);
+  const captureMode = mode === 'crop' ? 'crop' : 'page';
+  const params = new URLSearchParams({ page: String(safePage), from: 'note' });
+  if (safeCrop) params.set('crop', safeCrop);
+  const readerUrl = `${origin}/reader/${encodeURIComponent(safeHash)}?${params.toString()}`;
+  const pageLabel = safeTotal ? `第 ${safePage} / ${safeTotal} 页` : `第 ${safePage} 页`;
+  const modeLabel = captureMode === 'crop' ? '框选截图' : '整页截图';
+
+  return `<figure class="note-image-block note-book-capture" contenteditable="false" data-note-atomic="1" data-note-image-id="${id}" data-note-width="82" data-note-align="left" style="--note-image-width:82%" data-shufang-hash="${escapeHtmlAttr(safeHash)}" data-shufang-page="${safePage}" data-shufang-total-pages="${safeTotal}" data-shufang-title="${escapeHtmlAttr(title)}" data-shufang-relative-path="${escapeHtmlAttr(rel)}" data-shufang-crop="${escapeHtmlAttr(safeCrop)}" data-shufang-origin="${escapeHtmlAttr(origin)}" data-shufang-mode="${captureMode}"><img src="${escapeHtmlAttr(imageUrl)}" alt="${escapeHtmlAttr(`${title} ${pageLabel} ${modeLabel}`)}"><figcaption class="note-book-source" contenteditable="false" data-note-readonly="1"><span class="note-book-source-meta">${escapeHtmlAttr(title)} · ${pageLabel} · ${modeLabel}</span><a class="note-book-source-link" href="${escapeHtmlAttr(readerUrl)}" target="_blank" rel="noreferrer" data-shufang-open="1" contenteditable="false">打开原书 ↗</a></figcaption></figure>`;
+}
+
+
+function shufangExcerptMarkup({ bookHash, bookTitle, relativePath, format, scope, start, end, quote, progress, chapterIndex, chapterTotal, chapterTitle, shufangOrigin }) {
+  const safeHash = /^[a-f0-9]{64}$/i.test(String(bookHash || '')) ? String(bookHash).toLowerCase() : '';
+  const safeFormat = ['txt', 'md', 'epub'].includes(String(format || '').toLowerCase()) ? String(format).toLowerCase() : 'txt';
+  const safeStart = Math.max(0, Math.floor(Number(start) || 0));
+  const safeEnd = Math.max(safeStart + 1, Math.floor(Number(end) || safeStart + 1));
+  const safeProgress = Math.max(0, Math.min(1, Number(progress) || 0));
+  const safeChapter = Number.isFinite(Number(chapterIndex)) ? Math.max(-1, Math.floor(Number(chapterIndex))) : -1;
+  const safeChapterTotal = Math.max(0, Math.floor(Number(chapterTotal) || 0));
+  const origin = safeHttpOrigin(shufangOrigin);
+  const title = String(bookTitle || '未命名书籍').slice(0, 300);
+  const rel = String(relativePath || '').slice(0, 1000);
+  const safeScope = String(scope || '').slice(0, 2048);
+  const chapterName = String(chapterTitle || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  const text = String(quote || '').replace(/\r\n?/g, '\n').slice(0, 20000);
+  const params = new URLSearchParams({
+    from: 'note',
+    start: String(safeStart),
+    end: String(safeEnd),
+    progress: safeProgress.toFixed(6),
+  });
+  if (safeFormat === 'epub' && safeChapter >= 0) params.set('chapter', String(safeChapter));
+  const readerUrl = `${origin}/reader/${encodeURIComponent(safeHash)}?${params.toString()}`;
+  let locationLabel;
+  if (safeFormat === 'epub') {
+    const n = Math.max(1, safeChapter + 1);
+    locationLabel = safeChapterTotal ? `第 ${n} / ${safeChapterTotal} 章` : `第 ${n} 章`;
+    if (chapterName) locationLabel += ` · ${chapterName}`;
+  } else {
+    locationLabel = `文本 ${Math.round(safeProgress * 100)}%`;
+  }
+  const typeLabel = '划线摘录';
+  const quoteHtml = escapeHtmlAttr(text).replace(/\n/g, '<br>');
+
+  return `<section class="note-book-excerpt" contenteditable="false" data-note-atomic="1" data-shufang-hash="${escapeHtmlAttr(safeHash)}" data-shufang-format="${escapeHtmlAttr(safeFormat)}" data-shufang-scope="${escapeHtmlAttr(safeScope)}" data-shufang-start="${safeStart}" data-shufang-end="${safeEnd}" data-shufang-progress="${safeProgress.toFixed(6)}" data-shufang-chapter="${safeChapter}" data-shufang-chapter-total="${safeChapterTotal}" data-shufang-title="${escapeHtmlAttr(title)}" data-shufang-relative-path="${escapeHtmlAttr(rel)}"><blockquote class="note-book-excerpt-text">${quoteHtml}</blockquote><div class="note-book-source" contenteditable="false" data-note-readonly="1"><span class="note-book-source-meta">${escapeHtmlAttr(title)} · ${escapeHtmlAttr(locationLabel)} · ${typeLabel}</span><a class="note-book-source-link" href="${escapeHtmlAttr(readerUrl)}" target="_blank" rel="noreferrer" data-shufang-open="1" contenteditable="false">打开原书 ↗</a></div></section>`;
+}
+
+
+function safeWebUrl(value = '') {
+  try {
+    const url = new URL(String(value || '').trim());
+    if (!/^https?:$/.test(url.protocol)) return '';
+    return url.href.slice(0, 6000);
+  } catch {
+    return '';
+  }
+}
+
+function webSourceTitle(pageTitle = '', pageUrl = '') {
+  let title = String(pageTitle || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+  if (title) return title;
+  try { return new URL(pageUrl).hostname.slice(0, 300); } catch { return '网页'; }
+}
+
+function chromeExcerptMarkup({ pageTitle, pageUrl, quote }) {
+  const url = safeWebUrl(pageUrl);
+  const title = webSourceTitle(pageTitle, url);
+  const text = String(quote || '').replace(/\r\n?/g, '\n').slice(0, 20000);
+  const quoteHtml = escapeHtmlAttr(text).replace(/\n/g, '<br>');
+  return `<section class="note-book-excerpt note-web-excerpt" contenteditable="false" data-note-atomic="1" data-web-url="${escapeHtmlAttr(url)}" data-web-title="${escapeHtmlAttr(title)}"><blockquote class="note-book-excerpt-text note-web-excerpt-text">${quoteHtml}</blockquote><div class="note-book-source note-web-source" contenteditable="false" data-note-readonly="1"><span class="note-book-source-meta">${escapeHtmlAttr(title)} · 网页文字摘录</span><a class="note-book-source-link" href="${escapeHtmlAttr(url)}" target="_blank" rel="noreferrer" data-web-open="1" contenteditable="false">打开网页 ↗</a></div></section>`;
+}
+
+function chromeCaptureMarkup({ imageUrl, pageTitle, pageUrl }) {
+  const id = `img-${crypto.randomUUID()}`;
+  const url = safeWebUrl(pageUrl);
+  const title = webSourceTitle(pageTitle, url);
+  return `<figure class="note-image-block note-book-capture note-web-capture" contenteditable="false" data-note-atomic="1" data-note-image-id="${id}" data-note-width="82" data-note-align="left" style="--note-image-width:82%" data-web-url="${escapeHtmlAttr(url)}" data-web-title="${escapeHtmlAttr(title)}"><img src="${escapeHtmlAttr(imageUrl)}" alt="${escapeHtmlAttr(`${title} 网页框选截图`)}"><figcaption class="note-book-source note-web-source" contenteditable="false" data-note-readonly="1"><span class="note-book-source-meta">${escapeHtmlAttr(title)} · 网页框选截图</span><a class="note-book-source-link" href="${escapeHtmlAttr(url)}" target="_blank" rel="noreferrer" data-web-open="1" contenteditable="false">打开网页 ↗</a></figcaption></figure>`;
+}
+
+function endsWithBlankParagraph(html = '') {
+  return /<p(?:\s[^>]*)?>\s*(?:<br\s*\/?\s*>)?\s*<\/p>\s*$/i.test(String(html || ''));
+}
+
+function appendCaptureMarkup(note, markup) {
+  const spacer = '<p data-note-spacer="capture"><br></p>';
+  const content = String(note?.content || '');
+
+  if (note?.type === 'html' && /<\/body\s*>/i.test(content)) {
+    return content.replace(/<\/body\s*>/i, (closingTag, offset) => {
+      const beforeBodyEnd = content.slice(0, offset);
+      const before = beforeBodyEnd.trim() && !endsWithBlankParagraph(beforeBodyEnd) ? spacer : '';
+      return `${before}${markup}${spacer}${closingTag}`;
+    });
+  }
+
+  const before = content.trim() && !endsWithBlankParagraph(content) ? spacer : '';
+  return `${content}${before}${markup}${spacer}`;
+}
+
+function readShufangServerState() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SHUFANG_SERVER_STATE_FILE, 'utf8'));
+    if (!parsed || typeof parsed !== 'object') return null;
+    const origin = safeHttpOrigin(parsed.origin, '');
+    if (!origin) return null;
+    return { ...parsed, origin };
+  } catch {
+    return null;
+  }
+}
+
+
+const unlockSessions = new Map();
+
+function readFolders() {
+  try {
+    if (!fs.existsSync(FOLDERS_FILE)) return [];
+    const parsed = JSON.parse(fs.readFileSync(FOLDERS_FILE, 'utf8') || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(item => item && typeof item === 'object' && typeof item.id === 'string')
+      .map(item => ({
+        id: String(item.id),
+        name: String(item.name || '').trim().slice(0, 80) || '未命名目录',
+        createdAt: String(item.createdAt || new Date().toISOString()),
+        updatedAt: String(item.updatedAt || item.createdAt || new Date().toISOString())
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function writeFolders(folders) {
+  const list = Array.isArray(folders) ? folders : [];
+  const tmp = `${FOLDERS_FILE}.tmp-${process.pid}-${Date.now()}`;
+  let movedCurrent = false;
+  fs.writeFileSync(tmp, JSON.stringify(list, null, 2), 'utf8');
+  try {
+    if (fs.existsSync(FOLDERS_PREVIOUS_FILE)) fs.unlinkSync(FOLDERS_PREVIOUS_FILE);
+    if (fs.existsSync(FOLDERS_FILE)) {
+      fs.renameSync(FOLDERS_FILE, FOLDERS_PREVIOUS_FILE);
+      movedCurrent = true;
+    }
+    fs.renameSync(tmp, FOLDERS_FILE);
+    if (fs.existsSync(FOLDERS_PREVIOUS_FILE)) fs.unlinkSync(FOLDERS_PREVIOUS_FILE);
+  } catch (error) {
+    try {
+      if (!fs.existsSync(FOLDERS_FILE) && movedCurrent && fs.existsSync(FOLDERS_PREVIOUS_FILE)) {
+        fs.renameSync(FOLDERS_PREVIOUS_FILE, FOLDERS_FILE);
+      }
+    } catch {}
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
+    throw error;
+  }
+}
+
+function normalizeFolderId(value, folders = readFolders()) {
+  const id = String(value || '').trim();
+  if (!id || id === 'root') return null;
+  return folders.some(folder => folder.id === id) ? id : null;
+}
+
+function lockedNoteMeta(note) {
+  return {
+    id: note.id,
+    title: '已加锁笔记',
+    type: 'locked',
+    summary: '需要密码访问',
+    folderId: note.folderId || null,
+    locked: true,
+    createdAt: note.createdAt,
+    updatedAt: note.updatedAt
+  };
+}
+
+function deriveLockKey(password, salt) {
+  const text = String(password || '');
+  if (text.length < 4) throw new Error('密码至少需要 4 个字符');
+  if (text.length > 256) throw new Error('密码过长');
+  return crypto.scryptSync(text, salt, 32, {
+    N: LOCK_SCRYPT_N,
+    r: LOCK_SCRYPT_R,
+    p: LOCK_SCRYPT_P,
+    maxmem: 64 * 1024 * 1024
+  });
+}
+
+function encryptJsonWithKey(payload, key, salt) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const plaintext = Buffer.from(JSON.stringify(payload), 'utf8');
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    version: 1,
+    algorithm: 'aes-256-gcm',
+    kdf: 'scrypt',
+    scryptN: LOCK_SCRYPT_N,
+    scryptR: LOCK_SCRYPT_R,
+    scryptP: LOCK_SCRYPT_P,
+    salt: Buffer.from(salt).toString('base64'),
+    iv: iv.toString('base64'),
+    tag: tag.toString('base64'),
+    ciphertext: ciphertext.toString('base64')
+  };
+}
+
+function decryptJsonWithKey(encryption, key) {
+  if (!encryption || encryption.version !== 1 || encryption.algorithm !== 'aes-256-gcm') {
+    throw new Error('不支持的加密数据格式');
+  }
+  try {
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      key,
+      Buffer.from(encryption.iv, 'base64')
+    );
+    decipher.setAuthTag(Buffer.from(encryption.tag, 'base64'));
+    const plaintext = Buffer.concat([
+      decipher.update(Buffer.from(encryption.ciphertext, 'base64')),
+      decipher.final()
+    ]);
+    return JSON.parse(plaintext.toString('utf8'));
+  } catch {
+    throw new Error('密码错误');
+  }
+}
+
+function mimeForUploadName(name = '') {
+  const ext = path.extname(String(name)).toLowerCase();
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.webp') return 'image/webp';
+  return 'image/png';
+}
+
+function decodeUploadName(value = '') {
+  try { return decodeURIComponent(String(value)); } catch { return String(value); }
+}
+
+function normalizeLockedContentForStorage(noteId, content = '') {
+  const escapedId = String(noteId || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`/api/notes/${escapedId}/attachments/([^?"'\\s)>]+)\\?token=[^"'\\s)>]+`, 'g');
+  return String(content || '').replace(re, (_match, encodedName) => `/uploads/${encodedName}`);
+}
+
+function uploadNamesFromContent(content = '') {
+  const names = new Set();
+  const re = /\/uploads\/([A-Za-z0-9%._-]+)/g;
+  let match;
+  while ((match = re.exec(String(content || '')))) {
+    const name = decodeUploadName(match[1]);
+    if (/^[A-Za-z0-9._-]+$/.test(name)) names.add(name);
+  }
+  return [...names];
+}
+
+function collectEncryptedAttachments(content, previousAttachments = {}) {
+  const attachments = { ...(previousAttachments || {}) };
+  const text = String(content || '');
+  const now = Date.now();
+
+  for (const name of uploadNamesFromContent(text)) {
+    const file = path.join(UPLOAD_DIR, name);
+    if (fs.existsSync(file)) {
+      attachments[name] = {
+        mime: mimeForUploadName(name),
+        data: fs.readFileSync(file).toString('base64')
+      };
+    }
+  }
+
+  for (const name of Object.keys(attachments)) {
+    const referenced = text.includes(`/uploads/${encodeURIComponent(name)}`) ||
+      text.includes(`/uploads/${name}`);
+    if (referenced) {
+      // A secure in-memory upload becomes committed once the note content
+      // actually references it.
+      if (attachments[name] && typeof attachments[name] === 'object') {
+        delete attachments[name].pendingUntil;
+      }
+      continue;
+    }
+
+    // Secure uploads are first packed directly into ciphertext and only then
+    // inserted into the editor. Keep a short encrypted grace period so another
+    // open Note window cannot accidentally discard the attachment in between.
+    const pendingUntil = Number(attachments[name]?.pendingUntil || 0);
+    if (pendingUntil > now) continue;
+    delete attachments[name];
+  }
+  return attachments;
+}
+
+function hydrateLockedContent(noteId, content, attachments, token) {
+  let output = String(content || '');
+  for (const name of Object.keys(attachments || {})) {
+    const encoded = encodeURIComponent(name);
+    const secure = `/api/notes/${encodeURIComponent(noteId)}/attachments/${encoded}?token=${encodeURIComponent(token)}`;
+    output = output
+      .split(`/uploads/${encoded}`).join(secure)
+      .split(`/uploads/${name}`).join(secure);
+  }
+  return output;
+}
+
+function notePayloadForEncryption(note, previousPayload = null) {
+  const content = normalizeLockedContentForStorage(note.id, String(note.content || ''));
+  const attachments = collectEncryptedAttachments(content, previousPayload?.attachments || {});
+  return {
+    title: String(note.title || '').trim().slice(0, 160) || '未命名笔记',
+    type: ['markdown', 'html', 'rich'].includes(note.type) ? note.type : 'rich',
+    content,
+    summary: summaryOf(content),
+    attachments
+  };
+}
+
+function createUnlockSession(noteId, key) {
+  const now = Date.now();
+  for (const [existingToken, session] of unlockSessions) {
+    if (session.expiresAt < now) unlockSessions.delete(existingToken);
+  }
+  const token = crypto.randomBytes(32).toString('base64url');
+  unlockSessions.set(token, {
+    noteId,
+    key: Buffer.from(key),
+    expiresAt: Date.now() + LOCK_SESSION_TTL_MS
+  });
+  return token;
+}
+
+function unlockSessionFor(req, noteId) {
+  const token = String(req.get('X-Note-Unlock-Token') || req.query.token || '').trim();
+  if (!token) return null;
+  const session = unlockSessions.get(token);
+  if (!session || session.noteId !== noteId || session.expiresAt < Date.now()) {
+    unlockSessions.delete(token);
+    return null;
+  }
+  session.expiresAt = Date.now() + LOCK_SESSION_TTL_MS;
+  return { token, ...session };
+}
+
+function revokeNoteSessions(noteId) {
+  for (const [token, session] of unlockSessions) {
+    if (session.noteId === noteId) unlockSessions.delete(token);
+  }
+}
+
+function decryptLockedNote(note, key, token = '') {
+  const payload = decryptJsonWithKey(note.encryption, key);
+  return {
+    id: note.id,
+    title: String(payload.title || '未命名笔记'),
+    type: ['markdown', 'html', 'rich'].includes(payload.type) ? payload.type : 'rich',
+    content: token
+      ? hydrateLockedContent(note.id, String(payload.content || ''), payload.attachments || {}, token)
+      : String(payload.content || ''),
+    summary: String(payload.summary || summaryOf(payload.content || '')),
+    folderId: note.folderId || null,
+    locked: true,
+    createdAt: note.createdAt,
+    updatedAt: note.updatedAt
+  };
+}
+
+function attachmentReferencedByUnlockedNote(name, notes, exceptId) {
+  const encoded = encodeURIComponent(name);
+  return notes.some(note =>
+    note && note.id !== exceptId && !note.locked &&
+    (String(note.content || '').includes(`/uploads/${name}`) ||
+      String(note.content || '').includes(`/uploads/${encoded}`))
+  );
+}
+
+function removePackedPlainAttachments(noteId, payload, notes) {
+  for (const name of Object.keys(payload?.attachments || {})) {
+    if (attachmentReferencedByUnlockedNote(name, notes, noteId)) continue;
+    try {
+      const file = path.join(UPLOAD_DIR, name);
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+    } catch {}
+  }
+}
+
+function restorePlainAttachments(payload) {
+  for (const [name, attachment] of Object.entries(payload?.attachments || {})) {
+    if (!/^[A-Za-z0-9._-]+$/.test(name)) continue;
+    const file = path.join(UPLOAD_DIR, name);
+    if (fs.existsSync(file)) continue;
+    try { fs.writeFileSync(file, Buffer.from(String(attachment.data || ''), 'base64')); } catch {}
+  }
+}
+
+function scrubLockedNoteFromHistory(noteId, lockedRecord) {
+  const files = new Set();
+
+  function walk(dir) {
+    if (!fs.existsSync(dir)) return;
+    for (const name of fs.readdirSync(dir)) {
+      const file = path.join(dir, name);
+      let stat;
+      try { stat = fs.statSync(file); } catch { continue; }
+      if (stat.isDirectory()) {
+        walk(file);
+        continue;
+      }
+      if (!stat.isFile()) continue;
+      // Historical Note data has used .json plus transactional .tmp-* files.
+      if (/\.json(?:\.|$)/i.test(name) || /^notes\.json\.(?:previous|tmp-)/i.test(name)) {
+        files.add(file);
+      }
+    }
+  }
+
+  walk(BACKUP_DIR);
+  walk(QUARANTINE_DIR);
+  walk(DATA_DIR);
+  if (fs.existsSync(DB_PREVIOUS_FILE)) files.add(DB_PREVIOUS_FILE);
+  files.delete(DB_FILE); // Canonical DB is already encrypted before this scrub runs.
+  files.delete(FOLDERS_FILE);
+  files.delete(FOLDERS_PREVIOUS_FILE);
+
+  function replaceNoteRecords(value) {
+    let changed = false;
+
+    function visit(node) {
+      if (Array.isArray(node)) {
+        return node.map(item => {
+          if (item && typeof item === 'object' && !Array.isArray(item) && item.id === noteId) {
+            changed = true;
+            return lockedRecord;
+          }
+          return visit(item);
+        });
+      }
+
+      if (node && typeof node === 'object') {
+        if (node.id === noteId && (
+          Object.prototype.hasOwnProperty.call(node, 'content') ||
+          Object.prototype.hasOwnProperty.call(node, 'title') ||
+          Object.prototype.hasOwnProperty.call(node, 'encryption')
+        )) {
+          changed = true;
+          return lockedRecord;
+        }
+        const out = {};
+        for (const [key, item] of Object.entries(node)) out[key] = visit(item);
+        return out;
+      }
+
+      return node;
+    }
+
+    const next = visit(value);
+    return { next, changed };
+  }
+
+  for (const file of files) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const { next, changed } = replaceNoteRecords(parsed);
+      if (changed) fs.writeFileSync(file, JSON.stringify(next, null, 2), 'utf8');
+    } catch {}
+  }
+}
+
+function broadcastFolderEvent(payload = {}) {
+  const event = { id: crypto.randomUUID(), time: new Date().toISOString(), ...payload };
+  const chunk = `event: folder\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const [id, client] of realtimeClients) {
+    try { client.write(chunk); } catch { realtimeClients.delete(id); }
+  }
+}
+
+function normalizeNote(input, previous = {}) {
+  const now = new Date().toISOString();
+  const type = ['markdown', 'html', 'rich'].includes(input.type)
+    ? input.type
+    : 'markdown';
+  const content = typeof input.content === 'string' ? input.content : '';
+  const title = String(input.title || '').trim().slice(0, 160) || '未命名笔记';
+  const folderId = Object.prototype.hasOwnProperty.call(input || {}, 'folderId')
+    ? normalizeFolderId(input.folderId)
+    : (previous.folderId || null);
+
+  return {
+    id: previous.id || crypto.randomUUID(),
+    title,
+    type,
+    content,
+    summary: summaryOf(content),
+    folderId,
+    locked: false,
+    createdAt: previous.createdAt || now,
+    updatedAt: now
+  };
+}
+
+app.get('/api/storage', (_req, res) => {
+  res.json({
+    storageRoot: STORAGE_ROOT,
+    dataDir: DATA_DIR,
+    uploadsDir: UPLOAD_DIR,
+    backupDir: BACKUP_DIR,
+    dbFile: DB_FILE,
+    quarantineDir: QUARANTINE_DIR,
+    cleanupReport: CLEANUP_MARKER_FILE
+  });
+});
+
+app.get('/api/backups', (_req, res) => {
+  try {
+    const backups = fs
+      .readdirSync(BACKUP_DIR)
+      .filter(name => /^notes-.*\.json$/i.test(name))
+      .map(name => {
+        const file = path.join(BACKUP_DIR, name);
+        const stat = fs.statSync(file);
+
+        return {
+          name,
+          createdAt: stat.mtime.toISOString(),
+          size: stat.size
+        };
+      })
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+    res.json(backups);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/backups/create', (_req, res) => {
+  try {
+    const current = readNotes();
+
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, '-');
+
+    const fileName = `manual-${stamp}.json`;
+    const file = path.join(BACKUP_DIR, fileName);
+
+    fs.writeFileSync(
+      file,
+      JSON.stringify(current, null, 2),
+      'utf8'
+    );
+
+    res.status(201).json({
+      name: fileName,
+      createdAt: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/folders', (_req, res) => {
+  const notes = readNotes();
+  const folders = readFolders().map(folder => ({
+    ...folder,
+    noteCount: notes.filter(note => (note.folderId || null) === folder.id).length
+  }));
+  res.json({
+    rootCount: notes.filter(note => !note.folderId).length,
+    folders
+  });
+});
+
+app.post('/api/folders', (req, res) => {
+  const name = String(req.body?.name || '').trim().slice(0, 80);
+  if (!name) return res.status(400).json({ error: '目录名称不能为空' });
+  const folders = readFolders();
+  if (folders.some(folder => folder.name.toLowerCase() === name.toLowerCase())) {
+    return res.status(409).json({ error: '已有同名目录' });
+  }
+  const now = new Date().toISOString();
+  const folder = { id: crypto.randomUUID(), name, createdAt: now, updatedAt: now };
+  folders.push(folder);
+  writeFolders(folders);
+  broadcastFolderEvent({ action: 'created', folder, sourceClientId: requestClientId(req) });
+  res.status(201).json(folder);
+});
+
+app.put('/api/folders/:id', (req, res) => {
+  const folders = readFolders();
+  const index = folders.findIndex(folder => folder.id === req.params.id);
+  if (index < 0) return res.status(404).json({ error: '目录不存在' });
+  const name = String(req.body?.name || '').trim().slice(0, 80);
+  if (!name) return res.status(400).json({ error: '目录名称不能为空' });
+  if (folders.some((folder, i) => i !== index && folder.name.toLowerCase() === name.toLowerCase())) {
+    return res.status(409).json({ error: '已有同名目录' });
+  }
+  folders[index] = { ...folders[index], name, updatedAt: new Date().toISOString() };
+  writeFolders(folders);
+  broadcastFolderEvent({ action: 'updated', folder: folders[index], sourceClientId: requestClientId(req) });
+  res.json(folders[index]);
+});
+
+app.delete('/api/folders/:id', (req, res) => {
+  const folders = readFolders();
+  const index = folders.findIndex(folder => folder.id === req.params.id);
+  if (index < 0) return res.status(404).json({ error: '目录不存在' });
+  const [deleted] = folders.splice(index, 1);
+  writeFolders(folders);
+
+  const notes = readNotes();
+  let changed = false;
+  for (const note of notes) {
+    if ((note.folderId || null) === deleted.id) {
+      note.folderId = null;
+      note.updatedAt = new Date().toISOString();
+      changed = true;
+    }
+  }
+  if (changed) writeNotes(notes);
+  broadcastFolderEvent({ action: 'deleted', folder: deleted, sourceClientId: requestClientId(req) });
+  res.status(204).end();
+});
+
+app.get('/api/notes', (req, res) => {
+  const q = String(req.query.q || '').trim().toLowerCase();
+  const folderQuery = req.query.folder == null ? null : String(req.query.folder || 'root');
+  let notes = readNotes().sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+
+  if (folderQuery != null) {
+    notes = notes.filter(note => folderQuery === 'root'
+      ? !note.folderId
+      : note.folderId === folderQuery);
+  }
+
+  if (q) {
+    notes = notes.filter(note => {
+      if (note.locked) return false;
+      return String(note.title || '').toLowerCase().includes(q) ||
+        String(note.content || '').toLowerCase().includes(q);
+    });
+  }
+
+  res.json(notes.map(noteMeta));
+});
+
+app.get('/api/notes/:id', (req, res) => {
+  const note = readNotes().find(n => n.id === req.params.id);
+  if (!note) return res.status(404).json({ error: 'Note not found' });
+  if (!note.locked) return res.json(note);
+  const session = unlockSessionFor(req, note.id);
+  if (!session) return res.json(lockedNoteMeta(note));
+  try {
+    return res.json(decryptLockedNote(note, session.key, session.token));
+  } catch (error) {
+    revokeNoteSessions(note.id);
+    return res.status(401).json({ error: error.message });
+  }
+});
+
+app.post('/api/notes', (req, res) => {
+  const notes = readNotes();
+  const note = normalizeNote(req.body);
+  notes.push(note);
+  writeNotes(notes);
+  broadcastNoteEvent({
+    action: 'created',
+    noteId: note.id,
+    note: noteMeta(note),
+    sourceClientId: requestClientId(req),
+    source: 'note'
+  });
+  res.status(201).json(note);
+});
+
+app.patch('/api/notes/:id/folder', (req, res) => {
+  const notes = readNotes();
+  const index = notes.findIndex(n => n.id === req.params.id);
+  if (index < 0) return res.status(404).json({ error: 'Note not found' });
+  if (notes[index].locked && !unlockSessionFor(req, notes[index].id)) {
+    return res.status(423).json({ error: '加锁笔记需要先输入密码才能移动目录' });
+  }
+  notes[index].folderId = normalizeFolderId(req.body?.folderId);
+  notes[index].updatedAt = new Date().toISOString();
+  writeNotes(notes);
+  broadcastNoteEvent({
+    action: 'moved',
+    noteId: notes[index].id,
+    note: noteMeta(notes[index]),
+    sourceClientId: requestClientId(req),
+    source: 'note'
+  });
+  res.json(noteMeta(notes[index]));
+});
+
+app.put('/api/notes/:id', (req, res) => {
+  const notes = readNotes();
+  const index = notes.findIndex(n => n.id === req.params.id);
+  if (index < 0) return res.status(404).json({ error: 'Note not found' });
+  const previous = notes[index];
+
+  if (!previous.locked) {
+    const note = normalizeNote(req.body, previous);
+    notes[index] = note;
+    writeNotes(notes);
+    broadcastNoteEvent({
+      action: 'updated',
+      noteId: note.id,
+      note: noteMeta(note),
+      sourceClientId: requestClientId(req),
+      source: 'note'
+    });
+    return res.json(note);
+  }
+
+  const session = unlockSessionFor(req, previous.id);
+  if (!session) return res.status(423).json({ error: '笔记已上锁，请重新输入密码' });
+
+  try {
+    const previousPayload = decryptJsonWithKey(previous.encryption, session.key);
+    const plainInput = {
+      id: previous.id,
+      title: String(req.body?.title || '').trim().slice(0, 160) || '未命名笔记',
+      type: ['markdown', 'html', 'rich'].includes(req.body?.type) ? req.body.type : 'rich',
+      content: String(req.body?.content || '')
+    };
+    const payload = notePayloadForEncryption(plainInput, previousPayload);
+    const salt = Buffer.from(previous.encryption.salt, 'base64');
+    const locked = {
+      id: previous.id,
+      folderId: previous.folderId || null,
+      locked: true,
+      encryption: encryptJsonWithKey(payload, session.key, salt),
+      createdAt: previous.createdAt,
+      updatedAt: new Date().toISOString()
+    };
+    notes[index] = locked;
+    writeNotes(notes);
+    removePackedPlainAttachments(locked.id, payload, notes);
+    broadcastNoteEvent({
+      action: 'updated',
+      noteId: locked.id,
+      note: noteMeta(locked),
+      sourceClientId: requestClientId(req),
+      source: 'note'
+    });
+    return res.json(decryptLockedNote(locked, session.key, session.token));
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+});
+
+app.post('/api/notes/:id/lock', (req, res) => {
+  const notes = readNotes();
+  const index = notes.findIndex(n => n.id === req.params.id);
+  if (index < 0) return res.status(404).json({ error: 'Note not found' });
+  const previous = notes[index];
+  if (previous.locked) return res.status(409).json({ error: '笔记已经加锁' });
+
+  try {
+    const salt = crypto.randomBytes(16);
+    const key = deriveLockKey(req.body?.password, salt);
+    const payload = notePayloadForEncryption(previous);
+    const locked = {
+      id: previous.id,
+      folderId: previous.folderId || null,
+      locked: true,
+      encryption: encryptJsonWithKey(payload, key, salt),
+      createdAt: previous.createdAt,
+      updatedAt: new Date().toISOString()
+    };
+    notes[index] = locked;
+    writeNotes(notes, { skipBackup: true });
+    scrubLockedNoteFromHistory(locked.id, locked);
+    removePackedPlainAttachments(locked.id, payload, notes);
+    revokeNoteSessions(locked.id);
+    broadcastNoteEvent({
+      action: 'locked',
+      noteId: locked.id,
+      note: lockedNoteMeta(locked),
+      sourceClientId: requestClientId(req),
+      source: 'note'
+    });
+    res.json(lockedNoteMeta(locked));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post('/api/notes/:id/unlock', (req, res) => {
+  const note = readNotes().find(n => n.id === req.params.id);
+  if (!note) return res.status(404).json({ error: 'Note not found' });
+  if (!note.locked) return res.status(409).json({ error: '笔记没有加锁' });
+  try {
+    const salt = Buffer.from(note.encryption.salt, 'base64');
+    const key = deriveLockKey(req.body?.password, salt);
+    decryptJsonWithKey(note.encryption, key);
+    const token = createUnlockSession(note.id, key);
+    res.json({
+      token,
+      expiresIn: Math.floor(LOCK_SESSION_TTL_MS / 1000),
+      note: decryptLockedNote(note, key, token)
+    });
+  } catch (error) {
+    res.status(401).json({ error: error.message });
+  }
+});
+
+app.post('/api/notes/:id/relock', (req, res) => {
+  const note = readNotes().find(n => n.id === req.params.id);
+  if (!note) return res.status(404).json({ error: 'Note not found' });
+  revokeNoteSessions(note.id);
+  if (note.locked) {
+    broadcastNoteEvent({
+      action: 'relocked',
+      noteId: note.id,
+      note: lockedNoteMeta(note),
+      sourceClientId: requestClientId(req),
+      source: 'note'
+    });
+  }
+  res.json(note.locked ? lockedNoteMeta(note) : noteMeta(note));
+});
+
+app.post('/api/notes/:id/remove-lock', (req, res) => {
+  const notes = readNotes();
+  const index = notes.findIndex(n => n.id === req.params.id);
+  if (index < 0) return res.status(404).json({ error: 'Note not found' });
+  const previous = notes[index];
+  if (!previous.locked) return res.status(409).json({ error: '笔记没有加锁' });
+  const session = unlockSessionFor(req, previous.id);
+  if (!session) return res.status(423).json({ error: '请先输入密码解锁' });
+  try {
+    const payload = decryptJsonWithKey(previous.encryption, session.key);
+    restorePlainAttachments(payload);
+    const now = new Date().toISOString();
+    const plain = {
+      id: previous.id,
+      title: String(payload.title || '未命名笔记'),
+      type: ['markdown', 'html', 'rich'].includes(payload.type) ? payload.type : 'rich',
+      content: String(payload.content || ''),
+      summary: String(payload.summary || summaryOf(payload.content || '')),
+      folderId: previous.folderId || null,
+      locked: false,
+      createdAt: previous.createdAt,
+      updatedAt: now
+    };
+    notes[index] = plain;
+    writeNotes(notes);
+    revokeNoteSessions(previous.id);
+    broadcastNoteEvent({
+      action: 'unlocked-permanently',
+      noteId: plain.id,
+      note: noteMeta(plain),
+      sourceClientId: requestClientId(req),
+      source: 'note'
+    });
+    res.json(plain);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get('/api/notes/:id/attachments/:name', (req, res) => {
+  const note = readNotes().find(n => n.id === req.params.id);
+  if (!note || !note.locked) return res.status(404).end();
+  const session = unlockSessionFor(req, note.id);
+  if (!session) return res.status(401).end();
+  try {
+    const payload = decryptJsonWithKey(note.encryption, session.key);
+    const name = decodeUploadName(req.params.name);
+    const attachment = payload?.attachments?.[name];
+    if (!attachment) return res.status(404).end();
+    res.set({
+      'Content-Type': String(attachment.mime || mimeForUploadName(name)),
+      'Cache-Control': 'no-store, private'
+    });
+    res.send(Buffer.from(String(attachment.data || ''), 'base64'));
+  } catch {
+    res.status(401).end();
+  }
+});
+
+app.delete('/api/notes/:id', (req, res) => {
+  const notes = readNotes();
+  const index = notes.findIndex(n => n.id === req.params.id);
+  if (index < 0) return res.status(404).json({ error: 'Note not found' });
+  if (notes[index].locked && !unlockSessionFor(req, notes[index].id)) {
+    return res.status(423).json({ error: '加锁笔记需要先输入密码才能删除' });
+  }
+  const [deleted] = notes.splice(index, 1);
+  writeNotes(notes);
+  revokeNoteSessions(req.params.id);
+  broadcastNoteEvent({
+    action: 'deleted',
+    noteId: req.params.id,
+    note: noteMeta(deleted),
+    sourceClientId: requestClientId(req),
+    source: 'note'
+  });
+  res.status(204).end();
+});
+
+marked.setOptions({
+  gfm: true,
+  breaks: true
+});
+
+app.post('/api/render', (req, res) => {
+  const type = ['html', 'rich'].includes(req.body.type)
+    ? req.body.type
+    : 'markdown';
+  const content = String(req.body.content || '');
+  try {
+    const html = type === 'markdown' ? marked.parse(content) : content;
+    res.json({ html });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+const imageStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  filename: (_req, file, cb) => {
+    const rawExt = path.extname(file.originalname || '').toLowerCase();
+    const ext = ['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(rawExt)
+      ? rawExt
+      : '.png';
+    cb(null, `${Date.now()}-${crypto.randomBytes(5).toString('hex')}${ext}`);
+  }
+});
+
+const upload = multer({
+  storage: imageStorage,
+  limits: { fileSize: 32 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype && file.mimetype.startsWith('image/')) return cb(null, true);
+    cb(new Error('Only image files are allowed'));
+  }
+});
+
+app.post('/api/upload', upload.single('image'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
+  res.status(201).json({
+    url: `/uploads/${encodeURIComponent(req.file.filename)}`,
+    name: req.file.originalname
+  });
+});
+
+const secureUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 32 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype && file.mimetype.startsWith('image/')) return cb(null, true);
+    cb(new Error('Only image files are allowed'));
+  }
+});
+
+app.post('/api/notes/:id/upload', secureUpload.single('image'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
+  const notes = readNotes();
+  const index = notes.findIndex(note => note.id === req.params.id);
+  if (index < 0) return res.status(404).json({ error: 'Note not found' });
+  const previous = notes[index];
+  if (!previous.locked) return res.status(409).json({ error: '笔记没有加锁' });
+  const session = unlockSessionFor(req, previous.id);
+  if (!session) return res.status(423).json({ error: '笔记已上锁，请重新输入密码' });
+
+  try {
+    const payload = decryptJsonWithKey(previous.encryption, session.key);
+    const rawExt = path.extname(req.file.originalname || '').toLowerCase();
+    const ext = ['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(rawExt) ? rawExt : '.png';
+    const name = `${Date.now()}-${crypto.randomBytes(5).toString('hex')}${ext}`;
+    payload.attachments = {
+      ...(payload.attachments || {}),
+      [name]: {
+        mime: String(req.file.mimetype || mimeForUploadName(name)),
+        data: req.file.buffer.toString('base64'),
+        pendingUntil: Date.now() + 10 * 60 * 1000
+      }
+    };
+    const salt = Buffer.from(previous.encryption.salt, 'base64');
+    const locked = {
+      ...previous,
+      encryption: encryptJsonWithKey(payload, session.key, salt),
+      updatedAt: new Date().toISOString()
+    };
+    notes[index] = locked;
+    writeNotes(notes);
+    const encoded = encodeURIComponent(name);
+    res.status(201).json({
+      url: `/api/notes/${encodeURIComponent(previous.id)}/attachments/${encoded}?token=${encodeURIComponent(session.token)}`,
+      name: req.file.originalname,
+      encrypted: true
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+
+
+app.get('/api/integrations/chrome/status', (_req, res) => {
+  res.json({ ok: true, app: 'Note', integration: 'chrome', version: '1.9.1' });
+});
+
+app.get('/api/integrations/chrome/targets', (req, res) => {
+  const q = String(req.query.q || '').trim().toLowerCase();
+  const folders = readFolders();
+  let notes = readNotes()
+    .filter(note => !note.locked)
+    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+  if (q) {
+    notes = notes.filter(note => String(note.title || '').toLowerCase().includes(q));
+  }
+  res.json({
+    folders,
+    notes: notes.map(note => ({
+      id: note.id,
+      title: note.title || '未命名笔记',
+      type: note.type,
+      folderId: note.folderId || null,
+      updatedAt: note.updatedAt
+    }))
+  });
+});
+
+app.post('/api/integrations/chrome/excerpt', (req, res) => {
+  try {
+    const pageUrl = safeWebUrl(req.body.pageUrl);
+    if (!pageUrl) return res.status(400).json({ error: '网页地址无效' });
+    const quote = String(req.body.quote || '').replace(/\r\n?/g, '\n').slice(0, 20000);
+    if (!quote.trim()) return res.status(400).json({ error: '摘录内容为空' });
+    const pageTitle = webSourceTitle(req.body.pageTitle, pageUrl);
+    const markup = chromeExcerptMarkup({ pageTitle, pageUrl, quote });
+    const notes = readNotes();
+    const targetId = String(req.body.noteId || '').trim();
+    let note;
+    if (targetId) {
+      const index = notes.findIndex(item => item.id === targetId);
+      if (index < 0) return res.status(404).json({ error: '目标笔记不存在' });
+      const previous = notes[index];
+      if (previous.locked) return res.status(423).json({ error: '目标笔记已上锁，请先在 Note 中解锁' });
+      note = normalizeNote({ title: previous.title, type: previous.type, content: appendCaptureMarkup(previous, markup) }, previous);
+      notes[index] = note;
+    } else {
+      const title = String(req.body.newTitle || '').trim().slice(0, 160) || `${pageTitle} · 网页摘录`;
+      note = normalizeNote({
+        title,
+        type: 'rich',
+        folderId: normalizeFolderId(req.body.folderId),
+        content: `${markup}<p><br></p>`
+      });
+      notes.push(note);
+    }
+    writeNotes(notes);
+    broadcastNoteEvent({
+      action: 'chrome-excerpt', noteId: note.id, note: noteMeta(note),
+      sourceClientId: requestClientId(req), source: 'chrome', contentAppend: markup,
+      web: { pageUrl, pageTitle, kind: 'excerpt' }
+    });
+    res.status(targetId ? 200 : 201).json({ note: noteMeta(note), source: { pageUrl, pageTitle, kind: 'excerpt' } });
+  } catch (error) {
+    res.status(500).json({ error: error.message || '写入网页摘录失败' });
+  }
+});
+
+app.post('/api/integrations/chrome/capture', upload.single('image'), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: '没有收到截图' });
+    const pageUrl = safeWebUrl(req.body.pageUrl);
+    if (!pageUrl) {
+      try { fs.unlinkSync(req.file.path); } catch {}
+      return res.status(400).json({ error: '网页地址无效' });
+    }
+    const pageTitle = webSourceTitle(req.body.pageTitle, pageUrl);
+    const imageUrl = `/uploads/${encodeURIComponent(req.file.filename)}`;
+    const markup = chromeCaptureMarkup({ imageUrl, pageTitle, pageUrl });
+    const notes = readNotes();
+    const targetId = String(req.body.noteId || '').trim();
+    let note;
+    if (targetId) {
+      const index = notes.findIndex(item => item.id === targetId);
+      if (index < 0) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(404).json({ error: '目标笔记不存在' });
+      }
+      const previous = notes[index];
+      if (previous.locked) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(423).json({ error: '目标笔记已上锁，请先在 Note 中解锁' });
+      }
+      note = normalizeNote({ title: previous.title, type: previous.type, content: appendCaptureMarkup(previous, markup) }, previous);
+      notes[index] = note;
+    } else {
+      const title = String(req.body.newTitle || '').trim().slice(0, 160) || `${pageTitle} · 网页截图`;
+      note = normalizeNote({
+        title,
+        type: 'rich',
+        folderId: normalizeFolderId(req.body.folderId),
+        content: `${markup}<p><br></p>`
+      });
+      notes.push(note);
+    }
+    writeNotes(notes);
+    broadcastNoteEvent({
+      action: 'chrome-capture', noteId: note.id, note: noteMeta(note),
+      sourceClientId: requestClientId(req), source: 'chrome', contentAppend: markup,
+      web: { pageUrl, pageTitle, kind: 'capture' }
+    });
+    res.status(targetId ? 200 : 201).json({ note: noteMeta(note), imageUrl, source: { pageUrl, pageTitle, kind: 'capture' } });
+  } catch (error) {
+    try { if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); } catch {}
+    res.status(500).json({ error: error.message || '写入网页截图失败' });
+  }
+});
+
+app.post('/api/integrations/shufang/excerpt', (req, res) => {
+  try {
+    const bookHash = String(req.body.bookHash || '').trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/i.test(bookHash)) return res.status(400).json({ error: '书籍身份无效' });
+
+    const format = String(req.body.format || '').toLowerCase().replace(/^\./, '');
+    if (!['txt', 'md', 'epub'].includes(format)) return res.status(400).json({ error: '当前格式不支持文本摘录' });
+    const start = Math.max(0, Math.floor(Number(req.body.start) || 0));
+    const end = Math.max(0, Math.floor(Number(req.body.end) || 0));
+    const quote = String(req.body.quote || '').replace(/\r\n?/g, '\n').slice(0, 20000);
+    if (end <= start || !quote.trim()) return res.status(400).json({ error: '摘录内容为空' });
+
+    const progress = Math.max(0, Math.min(1, Number(req.body.progress) || 0));
+    const chapterIndex = Number.isFinite(Number(req.body.chapterIndex)) ? Math.max(-1, Math.floor(Number(req.body.chapterIndex))) : -1;
+    const chapterTotal = Math.max(0, Math.floor(Number(req.body.chapterTotal) || 0));
+    const markup = shufangExcerptMarkup({
+      bookHash,
+      bookTitle: req.body.bookTitle,
+      relativePath: req.body.relativePath,
+      format,
+      scope: req.body.scope,
+      start,
+      end,
+      quote,
+      progress,
+      chapterIndex,
+      chapterTotal,
+      chapterTitle: req.body.chapterTitle,
+      shufangOrigin: req.body.shufangOrigin,
+    });
+
+    const notes = readNotes();
+    const targetId = String(req.body.noteId || '').trim();
+    let note;
+    if (targetId) {
+      const index = notes.findIndex(item => item.id === targetId);
+      if (index < 0) return res.status(404).json({ error: '目标笔记不存在' });
+      const previous = notes[index];
+      if (previous.locked) return res.status(423).json({ error: '目标笔记已上锁，请先在 Note 中解除加密后再写入' });
+      note = normalizeNote({
+        title: previous.title,
+        type: previous.type,
+        content: appendCaptureMarkup(previous, markup),
+      }, previous);
+      notes[index] = note;
+    } else {
+      const loc = format === 'epub'
+        ? `第${Math.max(1, chapterIndex + 1)}章`
+        : `文本${Math.round(progress * 100)}%`;
+      const title = String(req.body.newTitle || '').trim().slice(0, 160)
+        || `《${String(req.body.bookTitle || '未命名书籍').slice(0, 100)}》摘录 · ${loc}`;
+      note = normalizeNote({ title, type: 'rich', content: `${markup}<p><br></p>` });
+      notes.push(note);
+    }
+
+    writeNotes(notes);
+    broadcastNoteEvent({
+      action: 'shufang-excerpt',
+      noteId: note.id,
+      note: noteMeta(note),
+      sourceClientId: requestClientId(req),
+      source: 'shufang',
+      contentAppend: markup,
+      excerpt: { bookHash, format, start, end, progress, chapterIndex, chapterTotal },
+    });
+    res.status(targetId ? 200 : 201).json({
+      note: { id: note.id, title: note.title, type: note.type, updatedAt: note.updatedAt },
+      source: { bookHash, format, start, end, progress, chapterIndex, chapterTotal },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || '写入笔记失败' });
+  }
+});
+
+app.post('/api/integrations/shufang/capture', upload.single('image'), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: '没有收到截图' });
+
+    const bookHash = String(req.body.bookHash || '').trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/i.test(bookHash)) {
+      try { fs.unlinkSync(req.file.path); } catch {}
+      return res.status(400).json({ error: '书籍身份无效' });
+    }
+
+    const page = Math.max(1, Math.floor(Number(req.body.page) || 1));
+    const totalPages = Math.max(0, Math.floor(Number(req.body.totalPages) || 0));
+    const imageUrl = `/uploads/${encodeURIComponent(req.file.filename)}`;
+    const markup = shufangCaptureMarkup({
+      imageUrl,
+      bookHash,
+      bookTitle: req.body.bookTitle,
+      page,
+      totalPages,
+      relativePath: req.body.relativePath,
+      crop: req.body.crop,
+      shufangOrigin: req.body.shufangOrigin,
+      mode: req.body.mode
+    });
+
+    const notes = readNotes();
+    const targetId = String(req.body.noteId || '').trim();
+    let note;
+
+    if (targetId) {
+      const index = notes.findIndex(item => item.id === targetId);
+      if (index < 0) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(404).json({ error: '目标笔记不存在' });
+      }
+      const previous = notes[index];
+      if (previous.locked) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(423).json({ error: '目标笔记已上锁，请先在 Note 中解除加密后再写入' });
+      }
+      note = normalizeNote({
+        title: previous.title,
+        type: previous.type,
+        content: appendCaptureMarkup(previous, markup)
+      }, previous);
+      notes[index] = note;
+    } else {
+      const title = String(req.body.newTitle || '').trim().slice(0, 160)
+        || `《${String(req.body.bookTitle || '未命名书籍').slice(0, 100)}》摘录 · 第${page}页`;
+      note = normalizeNote({ title, type: 'rich', content: `${markup}<p><br></p>` });
+      notes.push(note);
+    }
+
+    writeNotes(notes);
+    broadcastNoteEvent({
+      action: 'shufang-capture',
+      noteId: note.id,
+      note: noteMeta(note),
+      sourceClientId: requestClientId(req),
+      source: 'shufang',
+      contentAppend: markup,
+      capture: {
+        bookHash,
+        page,
+        totalPages,
+        crop: normalizeCropString(req.body.crop),
+        mode: req.body.mode === 'crop' ? 'crop' : 'page'
+      }
+    });
+    res.status(targetId ? 200 : 201).json({
+      note: { id: note.id, title: note.title, type: note.type, updatedAt: note.updatedAt },
+      imageUrl,
+      source: { bookHash, page, totalPages, crop: normalizeCropString(req.body.crop), mode: req.body.mode === 'crop' ? 'crop' : 'page' }
+    });
+  } catch (error) {
+    try { if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); } catch {}
+    res.status(500).json({ error: error.message || '写入笔记失败' });
+  }
+});
+
+app.get('/api/integrations/shufang/open/:hash', (req, res) => {
+  const hash = String(req.params.hash || '').toLowerCase();
+  if (!/^[a-f0-9]{64}$/i.test(hash)) return res.status(400).send('Bad hash');
+  const state = readShufangServerState();
+  const origin = state?.origin || 'http://127.0.0.1:39271';
+  const params = new URLSearchParams({ from: 'note' });
+  if (req.query.page != null) params.set('page', String(Math.max(1, Math.floor(Number(req.query.page) || 1))));
+  const crop = normalizeCropString(req.query.crop);
+  if (crop) params.set('crop', crop);
+  if (req.query.chapter != null && Number.isFinite(Number(req.query.chapter))) params.set('chapter', String(Math.max(0, Math.floor(Number(req.query.chapter)))));
+  if (req.query.start != null && Number.isFinite(Number(req.query.start))) params.set('start', String(Math.max(0, Math.floor(Number(req.query.start)))));
+  if (req.query.end != null && Number.isFinite(Number(req.query.end))) params.set('end', String(Math.max(0, Math.floor(Number(req.query.end)))));
+  if (req.query.progress != null && Number.isFinite(Number(req.query.progress))) params.set('progress', String(Math.max(0, Math.min(1, Number(req.query.progress)))));
+  res.redirect(302, `${origin}/reader/${encodeURIComponent(hash)}?${params.toString()}`);
+});
+
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  res.status(400).json({ error: err.message || 'Request failed' });
+});
+
+app.use((_req, res) => {
+  res.sendFile(path.join(ROOT, 'public', 'index.html'));
+});
+
+function openBrowser(url) {
+  if (process.env.NOTE_NO_OPEN === '1') return;
+  const platform = process.platform;
+  let command;
+  if (platform === 'win32') command = `start "" "${url}"`;
+  else if (platform === 'darwin') command = `open "${url}"`;
+  else command = `xdg-open "${url}"`;
+  exec(command, () => {});
+}
+
+app.listen(PORT, HOST, () => {
+  const url = `http://${HOST === '0.0.0.0' ? '127.0.0.1' : HOST}:${PORT}`;
+  console.log('');
+  console.log('  Note is running ✦');
+  console.log(`  ${url}`);
+  console.log('');
+  console.log(`  数据目录: ${STORAGE_ROOT}`);
+  console.log('');
+  console.log('  Ctrl+C to stop.');
+  console.log('');
+  openBrowser(url);
+});

@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Note // Local Workspace</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand-row">
+        <div class="brand">
+          <span class="brand-dot"></span>
+          <span>Note</span>
+        </div>
+        <button id="newBtn" class="icon-btn primary" title="新建笔记" aria-label="新建笔记">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 5v14M5 12h14"></path>
+          </svg>
+        </button>
+      </div>
+
+      <label class="search">
+        <span>⌕</span>
+        <input id="searchInput" placeholder="搜索笔记…" autocomplete="off" />
+        <kbd>⌘K</kbd>
+      </label>
+
+      <div class="folder-section-title">
+        <span>目录</span>
+        <button id="newFolderBtn" class="folder-add" title="新建目录">+</button>
+      </div>
+      <div id="folderList" class="folder-list"></div>
+
+      <div class="side-section-title">
+        <span id="currentFolderLabel">根目录</span>
+        <span id="noteCount">0</span>
+      </div>
+      <div id="noteList" class="note-list"></div>
+
+      <div class="sidebar-foot">
+        <span>本地存储</span>
+        <span class="status-dot"></span>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div class="doc-title-wrap">
+          <input id="titleInput" class="doc-title" value="" placeholder="未命名笔记" />
+          <div id="saveState" class="save-state">已保存</div>
+        </div>
+        <div class="top-actions">
+          <select id="folderSelect" class="folder-select" title="移动到目录">
+            <option value="root">根目录</option>
+          </select>
+          <button id="lockBtn" class="ghost lock-btn" title="给当前笔记加锁">上锁</button>
+          <button id="removeLockBtn" class="ghost" title="解除密码加密" hidden>解除加密</button>
+          <div class="segmented">
+            <button id="editTab" class="active">编辑</button>
+            <button id="previewTab">预览</button>
+            <button id="splitTab">分栏</button>
+          </div>
+          <div class="export-wrap">
+            <button id="exportBtn" class="ghost export-btn" title="导出当前笔记">
+              导出
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path d="m4 6 4 4 4-4"></path>
+              </svg>
+            </button>
+            <div id="exportMenu" class="export-menu" hidden>
+              <button data-export="html">
+                <span class="export-icon">⌘</span>
+                <span>
+                  <strong>导出 HTML</strong>
+                  <small>生成可独立打开的网页</small>
+                </span>
+              </button>
+              <button data-export="pdf">
+                <span class="export-icon">PDF</span>
+                <span>
+                  <strong>导出 PDF</strong>
+                  <small>打开系统打印 / 保存 PDF</small>
+                </span>
+              </button>
+            </div>
+          </div>
+          <button id="deleteBtn" class="ghost danger" title="删除当前笔记">删除</button>
+        </div>
+      </header>
+
+      <div class="modebar">
+        <div class="type-switch">
+          <button data-type="rich">富文本</button>
+          <button data-type="markdown" class="active">Markdown</button>
+          <button data-type="html">HTML</button>
+        </div>
+        <button id="convertFormatBtn" class="format-convert-btn" title="显式转换当前笔记格式">转为富文本</button>
+        <div class="tools">
+          <button data-action="undo" title="撤销 Ctrl+Z">↶</button>
+          <button data-action="redo" title="重做 Ctrl+Y">↷</button>
+          <span class="divider compact-divider"></span>
+          <button id="toolH2" data-action="h2" title="二级标题 / 取消标题 · Ctrl+H">H2</button>
+          <button id="toolBold" data-action="bold" title="加粗 / 取消加粗 · Ctrl+B"><b>B</b></button>
+          <button id="toolItalic" data-action="italic" title="斜体 / 取消斜体 · Ctrl+/"><i>I</i></button>
+          <button id="toolQuote" data-action="quote" title="引用 / 取消引用 · Ctrl+'">❝</button>
+          <button id="toolCode" data-action="code" title="代码块 / 取消代码块">&lt;/&gt;</button>
+          <button id="imageBtn" title="插入图片">▧</button>
+          <button id="toolLink" data-action="link" title="链接">↗</button>
+          <span class="divider"></span>
+          <span id="docTypeHint" class="hint">支持 Markdown + HTML 片段</span>
+        </div>
+      </div>
+
+      <section id="editorArea" class="editor-area split-view">
+        <div class="editor-pane">
+          <div id="lockedOverlay" class="locked-overlay" hidden>
+            <div class="locked-card">
+              <div class="locked-icon">⌾</div>
+              <strong>这篇笔记已加锁</strong>
+              <span>标题、正文和本地图片均以加密形式保存。</span>
+              <button id="unlockOverlayBtn" class="primary-action">输入密码解锁</button>
+            </div>
+          </div>
+          <textarea id="editor" spellcheck="false" placeholder="# 从这里开始写…"></textarea>
+          <div
+            id="richEditor"
+            class="rich-editor"
+            contenteditable="true"
+            spellcheck="true"
+            data-placeholder="从这里开始写…"
+            hidden
+          ></div>
+          <div id="dropHint" class="drop-hint">
+            <div class="drop-card">
+              <div class="drop-icon">↳</div>
+              <strong>放下 HTML 文件</strong>
+              <span>将直接创建为 HTML 笔记</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="preview-pane">
+          <div class="preview-head">
+            <span>PREVIEW</span>
+            <button id="openPreviewBtn" title="在新窗口打开">↗</button>
+          </div>
+          <iframe
+            id="previewFrame"
+            sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-scripts"
+            referrerpolicy="no-referrer"
+            title="笔记预览"
+          ></iframe>
+
+
+        </div>
+          <div id="imageInspector" class="image-inspector" hidden>
+            <div class="image-inspector-left">
+              <span class="image-label">图片</span>
+              <div class="image-align">
+                <button data-image-align="left" title="左对齐">左</button>
+                <button data-image-align="center" title="居中">中</button>
+                <button data-image-align="right" title="右对齐">右</button>
+              </div>
+            </div>
+            <label class="image-size">
+              <span>大小</span>
+              <input id="imageSizeInput" type="range" min="20" max="100" step="5" value="70" />
+              <output id="imageSizeValue">70%</output>
+            </label>
+            <button id="imageResetBtn" class="image-reset" title="恢复 100%">原始</button>
+            <button id="imageInspectorClose" class="image-close" title="关闭">×</button>
+          </div>
+      </section>
+    </main>
+  </div>
+
+  <input id="imageInput" type="file" accept="image/*" hidden />
+
+  <div id="toast" class="toast"></div>
+
+  <dialog id="passwordDialog">
+    <div class="dialog-body password-dialog-body">
+      <div class="dialog-mark lock-mark">⌾</div>
+      <h3 id="passwordDialogTitle">笔记加锁</h3>
+      <p id="passwordDialogText">密码只用于本机解密，不会写入数据文件。</p>
+      <input id="passwordInput" class="dialog-input" type="password" autocomplete="current-password" placeholder="输入密码" />
+      <input id="passwordConfirmInput" class="dialog-input" type="password" autocomplete="new-password" placeholder="再次输入密码" />
+      <div class="dialog-actions">
+        <button id="cancelPasswordBtn" class="ghost">取消</button>
+        <button id="confirmPasswordBtn" class="primary-action">确定</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="deleteDialog">
+    <div class="dialog-body">
+      <div class="dialog-mark">!</div>
+      <h3>删除这篇笔记？</h3>
+      <p>此操作无法撤销。</p>
+      <div class="dialog-actions">
+        <button id="cancelDeleteBtn" class="ghost">取消</button>
+        <button id="confirmDeleteBtn" class="danger solid">删除</button>
+      </div>
+    </div>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

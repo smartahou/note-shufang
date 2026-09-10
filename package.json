@@ -1,0 +1,24 @@
+{
+  "name": "note-shufang-local-suite",
+  "version": "1.10.6",
+  "private": true,
+  "description": "本地笔记 + 电子书房 + Chrome 网页摘录：统一 node start 启动、本地域名访问、来源关联、实时同步与 AES-256-GCM 加密。",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node start",
+    "note": "node note",
+    "shufang": "node shufang"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.77",
+    "adm-zip": "^0.5.16",
+    "express": "5.2.1",
+    "fast-xml-parser": "^5.2.5",
+    "marked": "18.0.11",
+    "multer": "2.3.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^5.4.149"
+  }
+}

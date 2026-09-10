@@ -1,0 +1,57 @@
+{
+  "manifest_version": 3,
+  "name": "Note 网页摘录",
+  "version": "1.3.0",
+  "description": "将网页选中文字或框选截图摘录到本地 Note；保留段落换行，支持 Chrome 快捷键与受限网页兼容选文。",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "contextMenus",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Note 网页摘录",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ],
+  "commands": {
+    "clip-selection": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "摘录选中文字到 Note"
+    },
+    "capture-region": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+S",
+        "mac": "Command+Shift+S"
+      },
+      "description": "框选截图到 Note"
+    }
+  }
+}

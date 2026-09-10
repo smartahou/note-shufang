@@ -1,0 +1,365 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const http = require('node:http');
+const net = require('node:net');
+const { spawn } = require('node:child_process');
+const { domainToASCII } = require('node:url');
+
+const ROOT = __dirname;
+const NOTE_PORT = Number(process.env.NOTE_PORT || 3030);
+const SHUFANG_PORT = Number(process.env.SHUFANG_PORT || 39271);
+const GATEWAY_PORT = Number(process.env.SUITE_PORT || 80);
+const GATEWAY_HOST = process.env.SUITE_HOST || '127.0.0.1';
+
+const NOTE_DOMAIN = process.env.NOTE_DOMAIN || '笔记.com';
+const SHUFANG_DOMAIN = process.env.SHUFANG_DOMAIN || '书房.com';
+const NOTE_ASCII = domainToASCII(NOTE_DOMAIN).toLowerCase();
+const SHUFANG_ASCII = domainToASCII(SHUFANG_DOMAIN).toLowerCase();
+const NOTE_PUBLIC_ORIGIN = `http://${NOTE_DOMAIN}`;
+const SHUFANG_PUBLIC_ORIGIN = `http://${SHUFANG_DOMAIN}`;
+
+const SHUFANG_DIR = path.join(os.homedir(), '.shufang');
+const DB_PATH = path.join(SHUFANG_DIR, 'library.db');
+const CONFIG_PATH = path.join(SHUFANG_DIR, 'start.json');
+const SERVER_STATE_PATH = path.join(SHUFANG_DIR, 'server.json');
+const children = new Set();
+let shuttingDown = false;
+let gateway = null;
+
+function cleanHost(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return '';
+  if (raw.startsWith('[')) {
+    const end = raw.indexOf(']');
+    return end >= 0 ? raw.slice(1, end) : raw;
+  }
+  return raw.split(':')[0];
+}
+
+function isDirectory(value) {
+  try { return !!value && fs.statSync(value).isDirectory(); } catch { return false; }
+}
+
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+function saveRoot(root) {
+  try {
+    fs.mkdirSync(SHUFANG_DIR, { recursive: true });
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify({ root, updatedAt: new Date().toISOString() }, null, 2), 'utf8');
+  } catch {}
+}
+
+function latestLibraryFromDb() {
+  if (!fs.existsSync(DB_PATH)) return '';
+  const originalEmitWarning = process.emitWarning.bind(process);
+  process.emitWarning = (warning, ...args) => {
+    const message = typeof warning === 'string' ? warning : String(warning?.message || warning || '');
+    if (/SQLite is an experimental feature/i.test(message)) return;
+    return originalEmitWarning(warning, ...args);
+  };
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(DB_PATH, { readOnly: true });
+    let rows = [];
+    try {
+      rows = db.prepare(`
+        SELECT root, scanned_at, id
+        FROM libraries
+        ORDER BY CASE WHEN scanned_at IS NULL THEN 1 ELSE 0 END, scanned_at DESC, id DESC
+      `).all();
+    } finally {
+      db.close();
+    }
+    for (const row of rows) {
+      const root = String(row?.root || '').trim();
+      if (isDirectory(root)) return root;
+    }
+  } catch {}
+  return '';
+}
+
+function resolveLibraryRoot(args) {
+  const explicit = args.find(x => x && !x.startsWith('--')) || '';
+  if (explicit) {
+    const root = path.resolve(explicit);
+    if (!isDirectory(root)) throw new Error(`书库目录不存在：${root}`);
+    saveRoot(root);
+    return root;
+  }
+
+  const saved = String(readJson(CONFIG_PATH)?.root || '').trim();
+  if (isDirectory(saved)) return saved;
+
+  const recent = latestLibraryFromDb();
+  if (recent) {
+    saveRoot(recent);
+    return recent;
+  }
+
+  throw new Error('还不知道书库目录。首次请执行：node start "G:\\books"');
+}
+
+function hostsFilePath() {
+  if (process.platform !== 'win32') return '/etc/hosts';
+  const win = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows';
+  return path.join(win, 'System32', 'drivers', 'etc', 'hosts');
+}
+
+function hostsConfigured() {
+  try {
+    const text = fs.readFileSync(hostsFilePath(), 'utf8').toLowerCase();
+    const hasNote = new RegExp(`^\\s*127\\.0\\.0\\.1\\s+[^#\\r\\n]*\\b${NOTE_ASCII.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`, 'mi').test(text);
+    const hasShufang = new RegExp(`^\\s*127\\.0\\.0\\.1\\s+[^#\\r\\n]*\\b${SHUFANG_ASCII.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`, 'mi').test(text);
+    return hasNote && hasShufang;
+  } catch {
+    return false;
+  }
+}
+
+function printHostsHelp() {
+  console.log('\n  本地域名还没有写入 hosts。请以管理员权限编辑：');
+  console.log(`  ${hostsFilePath()}`);
+  console.log('\n  加入这两行（使用 Punycode 最稳定）：');
+  console.log(`  127.0.0.1 ${NOTE_ASCII}    # ${NOTE_DOMAIN}`);
+  console.log(`  127.0.0.1 ${SHUFANG_ASCII}    # ${SHUFANG_DOMAIN}`);
+  console.log('\n  保存后浏览器访问：');
+  console.log(`  ${NOTE_PUBLIC_ORIGIN}`);
+  console.log(`  ${SHUFANG_PUBLIC_ORIGIN}\n`);
+}
+
+function requestStatus(port, pathname, timeout = 1200) {
+  return new Promise(resolve => {
+    const req = http.get({ host: '127.0.0.1', port, path: pathname, timeout }, res => {
+      res.resume();
+      resolve(Number(res.statusCode || 0));
+    });
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => resolve(0));
+  });
+}
+
+async function isNoteReady() {
+  const code = await requestStatus(NOTE_PORT, '/api/notes');
+  return code >= 200 && code < 500;
+}
+
+async function isShufangReady() {
+  const code = await requestStatus(SHUFANG_PORT, '/api/facets');
+  return code >= 200 && code < 500;
+}
+
+function portOpen(port) {
+  return new Promise(resolve => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    const done = value => { try { socket.destroy(); } catch {} resolve(value); };
+    socket.setTimeout(600);
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => done(false));
+  });
+}
+
+function spawnService(file, args, env) {
+  const child = spawn(process.execPath, [path.join(ROOT, file), ...args], {
+    cwd: ROOT,
+    env: { ...process.env, ...env },
+    stdio: 'inherit',
+    windowsHide: false,
+  });
+  children.add(child);
+  child.once('exit', () => children.delete(child));
+  return child;
+}
+
+async function ensureServices(libraryRoot, usePublicDomains) {
+  const noteReady = await isNoteReady();
+  if (!noteReady) {
+    if (await portOpen(NOTE_PORT)) throw new Error(`端口 ${NOTE_PORT} 已被其他程序占用，无法启动 Note。`);
+    spawnService('note', [], {
+      NOTE_PORT: String(NOTE_PORT),
+      NOTE_NO_OPEN: '1',
+    });
+  }
+
+  const shufangReady = await isShufangReady();
+  if (!shufangReady) {
+    if (await portOpen(SHUFANG_PORT)) throw new Error(`端口 ${SHUFANG_PORT} 已被其他程序占用，无法启动书房。`);
+    const publicEnv = usePublicDomains ? { NOTE_PUBLIC_ORIGIN, SHUFANG_PUBLIC_ORIGIN } : {};
+    spawnService('shufang', [libraryRoot], {
+      SHUFANG_PORT: String(SHUFANG_PORT),
+      SHUFANG_NO_OPEN: '1',
+      NOTE_ORIGIN: `http://127.0.0.1:${NOTE_PORT}`,
+      ...publicEnv,
+    });
+  } else {
+    const state = readJson(SERVER_STATE_PATH);
+    const runningRoot = String(state?.root || '').trim();
+    if (runningRoot && path.resolve(runningRoot) !== path.resolve(libraryRoot)) {
+      throw new Error(`书房已经在端口 ${SHUFANG_PORT} 运行，但当前书库是：${runningRoot}\n请先关闭旧书房，再启动新书库。`);
+    }
+  }
+}
+
+function rewriteLocation(location, targetPort, publicOrigin) {
+  const value = String(location || '');
+  const internal = `http://127.0.0.1:${targetPort}`;
+  return value.startsWith(internal) ? publicOrigin + value.slice(internal.length) : value;
+}
+
+function proxyRequest(req, res, target) {
+  const headers = { ...req.headers };
+  headers.host = `127.0.0.1:${target.port}`;
+  headers['x-forwarded-host'] = req.headers.host || '';
+  headers['x-forwarded-proto'] = 'http';
+
+  const upstream = http.request({
+    host: '127.0.0.1',
+    port: target.port,
+    method: req.method,
+    path: req.url,
+    headers,
+  }, upstreamRes => {
+    const responseHeaders = { ...upstreamRes.headers };
+    if (responseHeaders.location) {
+      responseHeaders.location = rewriteLocation(responseHeaders.location, target.port, target.publicOrigin);
+    }
+    res.writeHead(upstreamRes.statusCode || 502, responseHeaders);
+    upstreamRes.pipe(res);
+  });
+
+  upstream.on('error', error => {
+    if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(`本地服务暂未就绪：${error.message}`);
+  });
+  req.on('aborted', () => upstream.destroy());
+  req.pipe(upstream);
+}
+
+function routeForHost(host) {
+  const ascii = domainToASCII(cleanHost(host)).toLowerCase();
+  if (ascii === NOTE_ASCII) return { port: NOTE_PORT, publicOrigin: NOTE_PUBLIC_ORIGIN, name: 'Note' };
+  if (ascii === SHUFANG_ASCII) return { port: SHUFANG_PORT, publicOrigin: SHUFANG_PUBLIC_ORIGIN, name: '书房' };
+  return null;
+}
+
+function startGateway() {
+  return new Promise((resolve, reject) => {
+    gateway = http.createServer((req, res) => {
+      if (req.url === '/.__note_shufang_suite_health__') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        return res.end(JSON.stringify({ ok: true, note: NOTE_ASCII, shufang: SHUFANG_ASCII }));
+      }
+      const target = routeForHost(req.headers.host);
+      if (!target) {
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        return res.end(`<!doctype html><meta charset="utf-8"><title>Note + 书房</title><style>body{font:16px/1.8 system-ui;padding:40px;max-width:720px;margin:auto;background:#0d1117;color:#e6edf3}a{color:#7ee787}</style><h1>Note + 书房</h1><p>请访问 <a href="${NOTE_PUBLIC_ORIGIN}">${NOTE_DOMAIN}</a> 或 <a href="${SHUFANG_PUBLIC_ORIGIN}">${SHUFANG_DOMAIN}</a>。</p>`);
+      }
+      proxyRequest(req, res, target);
+    });
+
+    gateway.once('error', reject);
+    gateway.listen(GATEWAY_PORT, GATEWAY_HOST, () => {
+      gateway.removeListener('error', reject);
+      gateway.on('error', error => console.error(`\n❌ 本地域名入口异常：${error.message}`));
+      resolve();
+    });
+  });
+}
+
+async function waitUntil(check, label, timeoutMs = 120000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await check()) return;
+    await new Promise(r => setTimeout(r, 250));
+  }
+  throw new Error(`${label}启动超时。请查看上方日志。`);
+}
+
+function openBrowser(url) {
+  try {
+    if (process.platform === 'win32') {
+      spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    } else if (process.platform === 'darwin') {
+      spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
+    } else {
+      spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
+    }
+  } catch {}
+}
+
+async function shutdown(code = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  process.exitCode = code;
+  if (gateway) {
+    try { gateway.close(); } catch {}
+  }
+  for (const child of [...children]) {
+    try { child.kill('SIGTERM'); } catch {}
+  }
+  setTimeout(() => process.exit(code), 300);
+}
+
+process.once('SIGINT', () => shutdown(0));
+process.once('SIGTERM', () => shutdown(0));
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.includes('-h') || args.includes('--help') || args.includes('帮助')) {
+    console.log(`\nNote + 书房 v1.10.0\n\n  node start\n  node start "G:\\books"   # 首次指定/切换书库\n\n本地域名：\n  ${NOTE_PUBLIC_ORIGIN}\n  ${SHUFANG_PUBLIC_ORIGIN}\n`);
+    return;
+  }
+
+  const libraryRoot = resolveLibraryRoot(args);
+  const hostReady = hostsConfigured();
+
+  console.log('\n  Note + 书房  v1.10.0');
+  console.log('  ─────────────────────────');
+  console.log(`  书库  ${libraryRoot}`);
+
+  await ensureServices(libraryRoot, hostReady);
+
+  try {
+    await startGateway();
+  } catch (error) {
+    if (error?.code === 'EADDRINUSE') {
+      throw new Error(`端口 ${GATEWAY_PORT} 已被占用，无法启用无端口本地域名。\n请关闭占用 127.0.0.1:${GATEWAY_PORT} 的程序后重试。`);
+    }
+    if (error?.code === 'EACCES') {
+      throw new Error(`没有权限监听 ${GATEWAY_HOST}:${GATEWAY_PORT}。请以管理员权限运行终端后再执行 node start。`);
+    }
+    throw error;
+  }
+
+  await Promise.all([
+    waitUntil(isNoteReady, 'Note'),
+    waitUntil(isShufangReady, '书房'),
+  ]);
+
+  console.log(`\n  ✓ Note   ${hostReady ? NOTE_PUBLIC_ORIGIN : `http://127.0.0.1:${NOTE_PORT}`}`);
+  console.log(`  ✓ 书房   ${hostReady ? SHUFANG_PUBLIC_ORIGIN : `http://127.0.0.1:${SHUFANG_PORT}`}`);
+  console.log(`  ✓ 入口   ${GATEWAY_HOST}:${GATEWAY_PORT}`);
+  console.log('\n  Ctrl+C 一次关闭整套应用。\n');
+
+  if (!hostReady) {
+    printHostsHelp();
+    if (!args.includes('--no-open')) {
+      openBrowser(`http://127.0.0.1:${NOTE_PORT}`);
+      openBrowser(`http://127.0.0.1:${SHUFANG_PORT}`);
+    }
+  } else if (!args.includes('--no-open')) {
+    openBrowser(NOTE_PUBLIC_ORIGIN);
+    openBrowser(SHUFANG_PUBLIC_ORIGIN);
+  }
+}
+
+main().catch(async error => {
+  console.error(`\n❌ ${error.message || error}\n`);
+  await shutdown(1);
+});
