@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Note 网页摘录",
-  "version": "1.3.0",
-  "description": "将网页选中文字或框选截图摘录到本地 Note；保留段落换行，支持 Chrome 快捷键与受限网页兼容选文。",
+  "version": "1.4.1",
+  "description": "将网页选中文字、选区中的图片或框选截图摘录到本地 Note；保留段落换行，支持 Chrome 快捷键与受限网页兼容选文。",
   "permissions": [
     "activeTab",
     "scripting",
@@ -11,8 +11,8 @@
     "tabs"
   ],
   "host_permissions": [
-    "http://127.0.0.1/*",
-    "http://localhost/*"
+    "http://*/*",
+    "https://*/*"
   ],
   "background": {
     "service_worker": "background.js"

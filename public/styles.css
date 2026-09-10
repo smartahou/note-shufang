@@ -877,6 +877,22 @@ button {
   margin: 0 0 9px;
 }
 
+.rich-editor .note-web-excerpt-image {
+  display: block;
+  margin: 10px 0;
+  line-height: 0;
+}
+
+.rich-editor .note-web-excerpt-image img {
+  display: block;
+  max-width: min(100%, 920px);
+  max-height: 70vh;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 6px;
+}
+
 /* 摘录块采用两段式删除：第一次 Backspace 只进入短暂的待删除状态。 */
 .rich-editor :is(.note-book-excerpt, figure.note-book-capture).__note-delete-armed {
   position: relative;

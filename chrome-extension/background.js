@@ -70,8 +70,8 @@ async function noteFetch(path, options = {}) {
 }
 
 async function ensureInjected(tabId) {
-  try { await chrome.scripting.insertCSS({ target: { tabId }, files: ['content.css'] }); } catch {}
-  try { await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }); } catch {}
+  try { await chrome.scripting.insertCSS({ target: { tabId, allFrames: true }, files: ['content.css'] }); } catch {}
+  try { await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['content.js'] }); } catch {}
 }
 
 async function activeWebTab() {
@@ -80,67 +80,165 @@ async function activeWebTab() {
   return tab;
 }
 
+function normalizeClipPayload(value) {
+  const clip = value && typeof value === 'object' ? value : {};
+  const quote = String(clip.quote || '').trim();
+  const images = Array.isArray(clip.images)
+    ? clip.images.slice(0, 12).map((image, index) => ({
+        key: String(image?.key || `img-${index}`).slice(0, 80),
+        src: String(image?.src || '').trim().slice(0, 12000),
+        alt: String(image?.alt || '').trim().slice(0, 500),
+        width: Math.max(0, Math.floor(Number(image?.width) || 0)),
+        height: Math.max(0, Math.floor(Number(image?.height) || 0))
+      })).filter(image => image.src)
+    : [];
+  const keys = new Set(images.map(image => image.key));
+  const parts = Array.isArray(clip.parts)
+    ? clip.parts.slice(0, 500).flatMap(part => {
+        if (part?.type === 'image') {
+          const key = String(part.key || '').slice(0, 80);
+          return keys.has(key) ? [{ type: 'image', key }] : [];
+        }
+        if (part?.type === 'text') {
+          const text = String(part.text || '').slice(0, 24000);
+          return text ? [{ type: 'text', text }] : [];
+        }
+        return [];
+      })
+    : [];
+  if (!parts.length && quote) parts.push({ type: 'text', text: quote });
+  return { quote, parts, images };
+}
+
+function clipHasContent(clip) {
+  return !!(clip && (String(clip.quote || '').trim() || (Array.isArray(clip.images) && clip.images.length)));
+}
+
+function clipScore(clip) {
+  return String(clip?.quote || '').length + (Array.isArray(clip?.images) ? clip.images.length * 1500 : 0);
+}
+
 async function getTabSelection(tab) {
   await ensureInjected(tab.id);
+
   try {
-    const response = await chrome.tabs.sendMessage(tab.id, { type: 'noteclip:get-selection' });
-    const quote = String(response?.quote || '').trim();
-    if (quote) return quote;
+    const response = normalizeClipPayload(await chrome.tabs.sendMessage(tab.id, { type: 'noteclip:get-selection' }));
+    if (clipHasContent(response)) return response;
   } catch {}
 
-  // Fallback: inspect every accessible frame. This also makes the shortcut work
-  // when the selected text lives inside an iframe.
+  // Query every accessible frame. content.js exposes this helper in the
+  // extension isolated world, so iframe selections retain their image parts.
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
       func: () => {
-        const normalize = value => String(value || '')
-          .replace(/\r\n?/g, '\n')
-          .replace(/\u00a0/g, ' ')
-          .replace(/[ \t]+\n/g, '\n')
-          .replace(/\n[ \t]+/g, '\n')
-          .replace(/\n{3,}/g, '\n\n')
-          .trim();
-        const active = document.activeElement;
-        if (active && /^(INPUT|TEXTAREA)$/.test(active.tagName || '') && typeof active.selectionStart === 'number' && active.selectionEnd > active.selectionStart) {
-          return normalize(String(active.value || '').slice(active.selectionStart, active.selectionEnd));
-        }
-        const sel = window.getSelection?.();
-        if (!sel || !sel.rangeCount) return '';
-        const parts = [];
-        for (let i = 0; i < sel.rangeCount; i += 1) {
-          const range = sel.getRangeAt(i);
-          if (range.collapsed) continue;
-          try {
-            const probe = document.createElement('div');
-            probe.style.cssText = 'position:fixed!important;left:-100000px!important;top:0!important;width:1200px!important;opacity:0!important;pointer-events:none!important;z-index:-2147483647!important;';
-            probe.appendChild(range.cloneContents());
-            (document.body || document.documentElement).appendChild(probe);
-            parts.push(normalize(probe.innerText || probe.textContent || range.toString()));
-            probe.remove();
-          } catch {
-            parts.push(normalize(range.toString()));
-          }
-        }
-        return normalize(parts.filter(Boolean).join('\n')) || normalize(sel.toString?.() || '');
+        try { return globalThis.__NOTECLIP_GET_SELECTION?.() || null; } catch { return null; }
       }
     });
-    const quotes = (results || []).map(item => String(item?.result || '').trim()).filter(Boolean);
-    if (quotes.length) return quotes.sort((a, b) => b.length - a.length)[0];
+    const clips = (results || [])
+      .map(item => normalizeClipPayload(item?.result))
+      .filter(clipHasContent)
+      .sort((a, b) => clipScore(b) - clipScore(a));
+    if (clips.length) return clips[0];
   } catch {}
-  return '';
+
+  return normalizeClipPayload(null);
 }
 
 async function openSelectionChooser(tab, selectionText = '') {
   await ensureInjected(tab.id);
-  let quote = String(selectionText || '').trim();
-  if (!quote) quote = await getTabSelection(tab);
-  if (!quote) {
+  let clip = await getTabSelection(tab);
+  if (!clipHasContent(clip) && String(selectionText || '').trim()) {
+    const quote = String(selectionText || '').trim();
+    clip = { quote, parts: [{ type: 'text', text: quote }], images: [] };
+  }
+  if (!clipHasContent(clip)) {
     const host = (() => { try { return new URL(tab.url).hostname; } catch { return ''; } })();
     const compat = await getCompatEnabled(host);
     throw new Error(compat ? '没有检测到选中文字，请重新框选后再试' : '请先选中文字；若网站限制选中，可开启“兼容选文”');
   }
-  await chrome.tabs.sendMessage(tab.id, { type: 'noteclip:open-selection', quote });
+  await chrome.tabs.sendMessage(tab.id, { type: 'noteclip:open-selection', clip });
+}
+
+function imageExtensionFromType(type = '') {
+  const mime = String(type || '').toLowerCase().split(';')[0].trim();
+  if (mime === 'image/jpeg') return '.jpg';
+  if (mime === 'image/gif') return '.gif';
+  if (mime === 'image/webp') return '.webp';
+  if (mime === 'image/png') return '.png';
+  return '';
+}
+
+function clipImageFileName(image, blob, index) {
+  const ext = imageExtensionFromType(blob?.type) || '.png';
+  let base = '';
+  try {
+    base = decodeURIComponent(new URL(image.src).pathname.split('/').pop() || '').replace(/[^a-z0-9._-]+/gi, '-');
+  } catch {}
+  base = base.replace(/\.(?:png|jpe?g|gif|webp)$/i, '').slice(0, 80) || `web-image-${index + 1}`;
+  return `${base}${ext}`;
+}
+
+async function fetchClipImage(image) {
+  const src = String(image?.src || '').trim();
+  if (!src || /^blob:/i.test(src)) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(src, {
+      credentials: 'include',
+      cache: 'force-cache',
+      signal: controller.signal
+    });
+    if (!response.ok) return null;
+    const blob = await response.blob();
+    const type = String(blob.type || response.headers.get('content-type') || '').toLowerCase().split(';')[0].trim();
+    if (!/^image\/(?:png|jpeg|gif|webp)$/i.test(type)) return null;
+    if (!blob.size || blob.size > 10 * 1024 * 1024) return null;
+    return blob.type === type ? blob : blob.slice(0, blob.size, type);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function saveRichExcerpt(payload) {
+  const clip = normalizeClipPayload(payload);
+  const form = new FormData();
+  for (const key of ['pageTitle', 'pageUrl', 'noteId', 'newTitle', 'folderId', 'quote']) {
+    if (payload[key] != null) form.append(key, String(payload[key]));
+  }
+  form.set('quote', clip.quote);
+  form.append('clipParts', JSON.stringify(clip.parts));
+
+  const imageMeta = [];
+  let totalBytes = 0;
+  let fileIndex = 0;
+
+  for (let index = 0; index < clip.images.length; index += 1) {
+    const image = clip.images[index];
+    let blob = null;
+    if (totalBytes < 30 * 1024 * 1024) blob = await fetchClipImage(image);
+    let localFileIndex = -1;
+    if (blob && totalBytes + blob.size <= 30 * 1024 * 1024) {
+      localFileIndex = fileIndex++;
+      totalBytes += blob.size;
+      form.append('images', blob, clipImageFileName(image, blob, index));
+    }
+    imageMeta.push({
+      key: image.key,
+      src: image.src,
+      alt: image.alt,
+      width: image.width,
+      height: image.height,
+      localFileIndex
+    });
+  }
+
+  form.append('imagesMeta', JSON.stringify(imageMeta));
+  return noteFetch('/api/integrations/chrome/excerpt', { method: 'POST', body: form });
 }
 
 async function startRegionCapture(tab) {
@@ -213,9 +311,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case 'note:save-excerpt': {
         const payload = message.payload || {};
-        const data = await noteFetch('/api/integrations/chrome/excerpt', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
-        });
+        const data = await saveRichExcerpt(payload);
         return { ok: true, data };
       }
       case 'note:save-capture': {

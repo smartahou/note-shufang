@@ -4,7 +4,7 @@
 
   const $ = (sel, root = document) => root.querySelector(sel);
   const pageInfo = () => ({ pageTitle: document.title || location.hostname, pageUrl: location.href });
-  let lastSelectionText = '';
+  let lastSelectionClip = null;
   let lastSelectionAt = 0;
   let compatEnabled = false;
   let compatObserver = null;
@@ -49,73 +49,301 @@
       .trim();
   }
 
-  function selectionFromInput() {
-    const el = document.activeElement;
-    if (!el || !/^(INPUT|TEXTAREA)$/.test(el.tagName || '')) return '';
-    if (typeof el.selectionStart !== 'number' || typeof el.selectionEnd !== 'number' || el.selectionEnd <= el.selectionStart) return '';
-    return normalizeClipText(String(el.value || '').slice(el.selectionStart, el.selectionEnd));
+  const CLIP_BLOCK_TAGS = new Set([
+    'ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DIV', 'DL', 'DT', 'DD',
+    'FIGCAPTION', 'FIGURE', 'FOOTER', 'HEADER', 'H1', 'H2', 'H3', 'H4',
+    'H5', 'H6', 'LI', 'MAIN', 'NAV', 'P', 'PRE', 'SECTION', 'TR'
+  ]);
+  const CLIP_SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'CANVAS']);
+  const MAX_CLIP_IMAGES = 12;
+
+  function emptyClip() {
+    return { quote: '', parts: [], images: [] };
   }
 
-  function rangeTextWithBreaks(range) {
+  function clipHasContent(clip) {
+    return !!(clip && (String(clip.quote || '').trim() || (Array.isArray(clip.images) && clip.images.length)));
+  }
+
+  function appendClipText(parts, value) {
+    const text = String(value || '');
+    if (!text) return;
+    const last = parts[parts.length - 1];
+    if (last?.type === 'text') last.text += text;
+    else parts.push({ type: 'text', text });
+  }
+
+  function appendClipBreak(parts) {
+    appendClipText(parts, '\n');
+  }
+
+  function normalizePartText(value) {
+    return String(value || '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/\n{3,}/g, '\n\n');
+  }
+
+  function resolveImageSource(img) {
+    if (!img) return '';
+    const candidates = [
+      img.currentSrc,
+      img.getAttribute?.('src'),
+      img.getAttribute?.('data-src'),
+      img.getAttribute?.('data-original'),
+      img.getAttribute?.('data-lazy-src'),
+      img.getAttribute?.('data-url')
+    ];
+    for (const raw of candidates) {
+      const value = String(raw || '').trim();
+      if (!value) continue;
+      if (/^(?:data:image\/|blob:)/i.test(value)) return value;
+      try {
+        const url = new URL(value, img.ownerDocument?.baseURI || document.baseURI);
+        if (/^https?:$/i.test(url.protocol)) return url.href;
+      } catch {}
+    }
+    return '';
+  }
+
+  function rangeOriginalImages(range) {
     try {
-      if (!range || range.collapsed) return '';
-      const owner = range.commonAncestorContainer?.ownerDocument || document;
-      const mount = owner.body || owner.documentElement;
-      if (!mount) return normalizeClipText(range.toString());
-      const probe = owner.createElement('div');
-      probe.setAttribute('data-noteclip-text-probe', '1');
-      probe.style.cssText = 'position:fixed!important;left:-100000px!important;top:0!important;width:1200px!important;max-width:none!important;height:auto!important;opacity:0!important;pointer-events:none!important;z-index:-2147483647!important;overflow:visible!important;';
-      probe.appendChild(range.cloneContents());
-      mount.appendChild(probe);
-      const text = normalizeClipText(probe.innerText || probe.textContent || range.toString());
-      probe.remove();
-      return text;
+      const ancestor = range.commonAncestorContainer?.nodeType === Node.ELEMENT_NODE
+        ? range.commonAncestorContainer
+        : range.commonAncestorContainer?.parentElement;
+      if (!ancestor) return [];
+      const candidates = [];
+      if (ancestor.matches?.('img')) candidates.push(ancestor);
+      candidates.push(...(ancestor.querySelectorAll?.('img') || []));
+      return candidates.filter(img => {
+        try { return range.intersectsNode(img); } catch { return false; }
+      });
     } catch {
-      try { return normalizeClipText(range?.toString?.() || ''); } catch { return ''; }
+      return [];
     }
   }
 
-  function selectionFromRoot(root) {
-    try {
-      const sel = root?.getSelection?.();
-      if (!sel || !sel.rangeCount) return normalizeClipText(sel?.toString?.() || '');
-      const parts = [];
-      for (let i = 0; i < sel.rangeCount; i += 1) {
-        const text = rangeTextWithBreaks(sel.getRangeAt(i));
-        if (text) parts.push(text);
-      }
-      return normalizeClipText(parts.join('\n')) || normalizeClipText(sel.toString?.() || '');
-    } catch {}
-    return '';
+  function imageDescriptor(img, index) {
+    const src = resolveImageSource(img);
+    if (!src) return null;
+    const width = Math.max(0, Math.round(Number(img?.naturalWidth || img?.width || 0)));
+    const height = Math.max(0, Math.round(Number(img?.naturalHeight || img?.height || 0)));
+    if ((width && width < 2) || (height && height < 2)) return null;
+    return {
+      key: `img-${index}`,
+      src,
+      alt: String(img?.getAttribute?.('alt') || img?.getAttribute?.('title') || '').replace(/\s+/g, ' ').trim().slice(0, 500),
+      width,
+      height
+    };
   }
 
-  function selectionFromOpenShadowRoots(root = document) {
-    let found = '';
+  function rangeToClip(range) {
+    if (!range || range.collapsed) return emptyClip();
+    const parts = [];
+    const images = [];
+    const originals = rangeOriginalImages(range);
+    let originalImageIndex = 0;
+
+    let fragment;
+    try { fragment = range.cloneContents(); } catch {
+      const quote = normalizeClipText(range.toString?.() || '');
+      return quote ? { quote, parts: [{ type: 'text', text: quote }], images: [] } : emptyClip();
+    }
+
+    function walk(node) {
+      if (!node) return;
+      if (node.nodeType === Node.TEXT_NODE) {
+        appendClipText(parts, node.nodeValue || '');
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) return;
+
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const tag = String(node.tagName || '').toUpperCase();
+        if (CLIP_SKIP_TAGS.has(tag)) return;
+        if (tag === 'BR') {
+          appendClipBreak(parts);
+          return;
+        }
+        if (tag === 'IMG') {
+          if (images.length >= MAX_CLIP_IMAGES) return;
+          const original = originals[originalImageIndex++] || node;
+          const meta = imageDescriptor(original, images.length) || imageDescriptor(node, images.length);
+          if (!meta) return;
+          images.push(meta);
+          parts.push({ type: 'image', key: meta.key });
+          return;
+        }
+        if (CLIP_BLOCK_TAGS.has(tag)) appendClipBreak(parts);
+        for (const child of node.childNodes || []) walk(child);
+        if (tag === 'TD' || tag === 'TH') appendClipText(parts, '\t');
+        if (CLIP_BLOCK_TAGS.has(tag)) appendClipBreak(parts);
+        return;
+      }
+
+      for (const child of node.childNodes || []) walk(child);
+    }
+
+    walk(fragment);
+
+    const normalizedParts = [];
+    for (const part of parts) {
+      if (part.type === 'image') {
+        normalizedParts.push(part);
+        continue;
+      }
+      const text = normalizePartText(part.text);
+      if (!text) continue;
+      const last = normalizedParts[normalizedParts.length - 1];
+      if (last?.type === 'text') last.text += text;
+      else normalizedParts.push({ type: 'text', text });
+    }
+
+    const firstText = normalizedParts.find(part => part.type === 'text');
+    const lastText = [...normalizedParts].reverse().find(part => part.type === 'text');
+    if (firstText) firstText.text = firstText.text.replace(/^\s+/, '');
+    if (lastText) lastText.text = lastText.text.replace(/\s+$/, '');
+
+    const cleanedParts = normalizedParts.filter(part => part.type === 'image' || String(part.text || '').length);
+    const quote = normalizeClipText(cleanedParts.filter(part => part.type === 'text').map(part => part.text).join(''));
+    return { quote, parts: cleanedParts, images };
+  }
+
+  function selectionClipFromInput() {
+    const el = document.activeElement;
+    if (!el || !/^(INPUT|TEXTAREA)$/.test(el.tagName || '')) return emptyClip();
+    if (typeof el.selectionStart !== 'number' || typeof el.selectionEnd !== 'number' || el.selectionEnd <= el.selectionStart) return emptyClip();
+    const quote = normalizeClipText(String(el.value || '').slice(el.selectionStart, el.selectionEnd));
+    return quote ? { quote, parts: [{ type: 'text', text: quote }], images: [] } : emptyClip();
+  }
+
+  function selectionClipFromRoot(root) {
+    try {
+      const sel = root?.getSelection?.();
+      if (!sel || !sel.rangeCount) return emptyClip();
+      const clips = [];
+      for (let i = 0; i < sel.rangeCount; i += 1) {
+        const clip = rangeToClip(sel.getRangeAt(i));
+        if (clipHasContent(clip)) clips.push(clip);
+      }
+      if (!clips.length) return emptyClip();
+
+      const combined = emptyClip();
+      for (const clip of clips) {
+        if (combined.parts.length && clip.parts.length) appendClipBreak(combined.parts);
+        const keyMap = new Map();
+        for (const image of clip.images) {
+          if (combined.images.length >= MAX_CLIP_IMAGES) break;
+          const key = `img-${combined.images.length}`;
+          keyMap.set(image.key, key);
+          combined.images.push({ ...image, key });
+        }
+        for (const part of clip.parts) {
+          if (part.type === 'image') {
+            const key = keyMap.get(part.key);
+            if (key) combined.parts.push({ type: 'image', key });
+          } else {
+            appendClipText(combined.parts, part.text);
+          }
+        }
+      }
+      combined.quote = normalizeClipText(combined.parts.filter(part => part.type === 'text').map(part => part.text).join(''));
+      return combined;
+    } catch {}
+    return emptyClip();
+  }
+
+  function selectionClipFromOpenShadowRoots(root = document) {
     try {
       for (const el of root.querySelectorAll?.('*') || []) {
         if (!el.shadowRoot) continue;
-        found = selectionFromRoot(el.shadowRoot) || selectionFromOpenShadowRoots(el.shadowRoot);
-        if (found) return found;
+        const direct = selectionClipFromRoot(el.shadowRoot);
+        if (clipHasContent(direct)) return direct;
+        const nested = selectionClipFromOpenShadowRoots(el.shadowRoot);
+        if (clipHasContent(nested)) return nested;
       }
     } catch {}
-    return '';
+    return emptyClip();
+  }
+
+  function liveSelectionClip() {
+    const input = selectionClipFromInput();
+    if (clipHasContent(input)) return input;
+    const win = selectionClipFromRoot(window);
+    if (clipHasContent(win)) return win;
+    const doc = selectionClipFromRoot(document);
+    if (clipHasContent(doc)) return doc;
+    return selectionClipFromOpenShadowRoots(document);
+  }
+
+  function currentSelectionClip(useCache = true) {
+    const clip = liveSelectionClip();
+    if (clipHasContent(clip)) {
+      lastSelectionClip = clip;
+      lastSelectionAt = Date.now();
+      return clip;
+    }
+    if (useCache && Date.now() - lastSelectionAt < 60000 && clipHasContent(lastSelectionClip)) return lastSelectionClip;
+    return emptyClip();
   }
 
   function currentSelectionText() {
-    const text = selectionFromInput() || selectionFromRoot(window) || selectionFromRoot(document) || selectionFromOpenShadowRoots(document);
-    if (text) { lastSelectionText = text; lastSelectionAt = Date.now(); }
-    const cached = Date.now() - lastSelectionAt < 60000 ? lastSelectionText : '';
-    return text || cached || '';
+    return currentSelectionClip(true).quote || '';
   }
 
   function refreshSelectionCache() {
-    const text = selectionFromInput() || selectionFromRoot(window) || selectionFromRoot(document) || selectionFromOpenShadowRoots(document);
-    if (text) { lastSelectionText = text; lastSelectionAt = Date.now(); }
+    const clip = liveSelectionClip();
+    if (clipHasContent(clip)) {
+      lastSelectionClip = clip;
+      lastSelectionAt = Date.now();
+    }
   }
+
+  // Background shortcuts can query the exact frame that owns the selection.
+  globalThis.__NOTECLIP_GET_SELECTION = () => currentSelectionClip(true);
 
   document.addEventListener('selectionchange', () => setTimeout(refreshSelectionCache, 0), true);
   document.addEventListener('mouseup', () => setTimeout(refreshSelectionCache, 0), true);
   document.addEventListener('keyup', () => setTimeout(refreshSelectionCache, 0), true);
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(reader.error || new Error('图片读取失败'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function materializeBlobImages(payload) {
+    if (!Array.isArray(payload?.images) || !payload.images.length) return payload;
+    const images = [];
+    let totalBytes = 0;
+    for (const image of payload.images) {
+      let next = { ...image };
+      const src = String(image?.src || '').trim();
+      if (/^blob:/i.test(src) && totalBytes < 20 * 1024 * 1024) {
+        try {
+          const response = await fetch(src);
+          if (response.ok) {
+            const blob = await response.blob();
+            if (/^image\//i.test(blob.type || '') && blob.size > 0 && blob.size <= 10 * 1024 * 1024 && totalBytes + blob.size <= 20 * 1024 * 1024) {
+              const dataUrl = await blobToDataUrl(blob);
+              if (/^data:image\//i.test(dataUrl)) {
+                next = { ...next, src: dataUrl };
+                totalBytes += blob.size;
+              }
+            }
+          }
+        } catch {}
+      }
+      images.push(next);
+    }
+    return { ...payload, images };
+  }
 
   async function openChooser(payload) {
     const now = Date.now();
@@ -164,7 +392,21 @@
     if (payload.kind === 'capture') {
       const img = document.createElement('img'); img.src = payload.imageDataUrl; img.alt = '截图预览'; preview.appendChild(img);
     } else {
-      preview.textContent = payload.quote;
+      const imageMap = new Map((payload.images || []).map(image => [image.key, image]));
+      for (const part of payload.parts || []) {
+        if (part?.type === 'image') {
+          const meta = imageMap.get(part.key);
+          if (!meta?.src) continue;
+          const img = document.createElement('img');
+          img.src = meta.src;
+          img.alt = meta.alt || '网页图片';
+          img.loading = 'lazy';
+          preview.appendChild(img);
+          continue;
+        }
+        if (part?.type === 'text' && part.text) preview.appendChild(document.createTextNode(part.text));
+      }
+      if (!preview.childNodes.length) preview.textContent = payload.quote || '';
     }
     const nameInput = $('.noteclip-new-name', overlay);
     nameInput.value = `${info.pageTitle} · ${payload.kind === 'capture' ? '网页截图' : '网页摘录'}`.slice(0, 160);
@@ -229,7 +471,8 @@
         if (payload.kind === 'capture') {
           result = await bg({ type: 'note:save-capture', payload: { ...payload, noteId, newTitle: noteId ? '' : nameInput.value.trim(), folderId: noteId ? '' : folderSelect.value } });
         } else {
-          result = await bg({ type: 'note:save-excerpt', payload: { ...payload, noteId, newTitle: noteId ? '' : nameInput.value.trim(), folderId: noteId ? '' : folderSelect.value } });
+          const richPayload = await materializeBlobImages(payload);
+          result = await bg({ type: 'note:save-excerpt', payload: { ...richPayload, noteId, newTitle: noteId ? '' : nameInput.value.trim(), folderId: noteId ? '' : folderSelect.value } });
         }
         const savedNoteId = String(result?.note?.id || noteId || '');
         if (savedNoteId) await bg({ type: 'note:last-target:set', noteId: savedNoteId }).catch(() => {});
@@ -363,12 +606,12 @@
   }
 
   async function clipCurrentSelection() {
-    const quote = currentSelectionText().trim();
-    if (!quote) {
+    const clip = currentSelectionClip(true);
+    if (!clipHasContent(clip)) {
       toast(compatEnabled ? '没有检测到选中文字，请重新框选后再按 Ctrl+Shift+Y' : '请先选中文字；受限网页可在插件中开启“兼容选文”', true);
       return;
     }
-    await openChooser({ kind: 'excerpt', quote });
+    await openChooser({ kind: 'excerpt', ...clip });
   }
 
   window.addEventListener('keydown', e => {
@@ -387,10 +630,15 @@
   }, true);
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.type === 'noteclip:open-selection') openChooser({ kind: 'excerpt', quote: String(message.quote || '').trim() });
+    if (message?.type === 'noteclip:open-selection') {
+      const clip = message.clip && clipHasContent(message.clip)
+        ? message.clip
+        : { quote: String(message.quote || '').trim(), parts: [{ type: 'text', text: String(message.quote || '').trim() }], images: [] };
+      openChooser({ kind: 'excerpt', ...clip });
+    }
     if (message?.type === 'noteclip:start-region') startRegionCapture();
     if (message?.type === 'noteclip:error') toast(message.message || '操作失败', true);
-    if (message?.type === 'noteclip:get-selection') { sendResponse({ quote: currentSelectionText() }); return; }
+    if (message?.type === 'noteclip:get-selection') { sendResponse(currentSelectionClip(true)); return; }
     if (message?.type === 'noteclip:compat:set') { setCompat(!!message.enabled); sendResponse({ enabled: compatEnabled }); return; }
     if (message?.type === 'noteclip:compat:get') { sendResponse({ enabled: compatEnabled }); return; }
   });

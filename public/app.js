@@ -1756,6 +1756,16 @@ const previewCss = `
   figure.note-book-capture .note-book-source { width: var(--note-image-width, 82%); }
   .note-book-excerpt { margin: 1.1em 0; }
   .note-book-excerpt-text { margin: 0 0 9px; }
+  .note-web-excerpt-image { display: block; margin: 10px 0; line-height: 0; }
+  .note-web-excerpt-image img {
+    display: block;
+    max-width: min(100%, 920px);
+    max-height: 70vh;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    border-radius: 6px;
+  }
   :is(figure.note-book-capture, .note-book-excerpt) + p:has(> br:only-child),
   p:has(> br:only-child):has(+ :is(figure.note-book-capture, .note-book-excerpt)) {
     min-height: 0;
@@ -3014,6 +3024,15 @@ function preparePrintableHtml(html) {
     figure.note-book-capture { margin: .65em 0 !important; }
     .note-book-excerpt { break-inside: avoid-page; margin: .7em 0 !important; }
     .note-book-excerpt-text { margin-bottom: 8px !important; }
+    .note-web-excerpt-image { display: block !important; margin: 8px 0 !important; line-height: 0 !important; }
+    .note-web-excerpt-image img {
+      display: block !important;
+      max-width: 100% !important;
+      max-height: none !important;
+      width: auto !important;
+      height: auto !important;
+      object-fit: contain !important;
+    }
 
     @media screen {
       body {

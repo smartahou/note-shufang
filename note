@@ -708,12 +708,86 @@ function webSourceTitle(pageTitle = '', pageUrl = '') {
   try { return new URL(pageUrl).hostname.slice(0, 300); } catch { return '网页'; }
 }
 
-function chromeExcerptMarkup({ pageTitle, pageUrl, quote }) {
+function safeWebImageUrl(value = '') {
+  const raw = String(value || '').trim();
+  try {
+    const url = new URL(raw);
+    if (!/^https?:$/.test(url.protocol)) return '';
+    return url.href.slice(0, 12000);
+  } catch {
+    return '';
+  }
+}
+
+function normalizeChromeClipParts(rawParts, fallbackQuote = '') {
+  let source = rawParts;
+  if (typeof source === 'string') {
+    try { source = JSON.parse(source); } catch { source = null; }
+  }
+  const parts = [];
+  let textBudget = 20000;
+  for (const part of Array.isArray(source) ? source.slice(0, 500) : []) {
+    if (part?.type === 'image') {
+      const key = String(part.key || '').trim().slice(0, 80);
+      if (key) parts.push({ type: 'image', key });
+      continue;
+    }
+    if (part?.type !== 'text' || textBudget <= 0) continue;
+    let text = String(part.text || '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\u00a0/g, ' ')
+      .slice(0, textBudget);
+    textBudget -= text.length;
+    if (text) parts.push({ type: 'text', text });
+  }
+  if (!parts.length) {
+    const text = String(fallbackQuote || '').replace(/\r\n?/g, '\n').slice(0, 20000);
+    if (text) parts.push({ type: 'text', text });
+  }
+  return parts;
+}
+
+function chromeExcerptMarkup({ pageTitle, pageUrl, quote, clipParts, images = [] }) {
   const url = safeWebUrl(pageUrl);
   const title = webSourceTitle(pageTitle, url);
-  const text = String(quote || '').replace(/\r\n?/g, '\n').slice(0, 20000);
-  const quoteHtml = escapeHtmlAttr(text).replace(/\n/g, '<br>');
-  return `<section class="note-book-excerpt note-web-excerpt" contenteditable="false" data-note-atomic="1" data-web-url="${escapeHtmlAttr(url)}" data-web-title="${escapeHtmlAttr(title)}"><blockquote class="note-book-excerpt-text note-web-excerpt-text">${quoteHtml}</blockquote><div class="note-book-source note-web-source" contenteditable="false" data-note-readonly="1"><span class="note-book-source-meta">${escapeHtmlAttr(title)} · 网页文字摘录</span><a class="note-book-source-link" href="${escapeHtmlAttr(url)}" target="_blank" rel="noreferrer" data-web-open="1" contenteditable="false">打开网页 ↗</a></div></section>`;
+  const imageMap = new Map();
+  for (const image of Array.isArray(images) ? images : []) {
+    const key = String(image?.key || '').trim().slice(0, 80);
+    const imageUrl = String(image?.url || '').trim();
+    if (!key || !imageUrl) continue;
+    imageMap.set(key, {
+      url: imageUrl,
+      alt: String(image?.alt || '').replace(/\s+/g, ' ').trim().slice(0, 500)
+    });
+  }
+
+  const parts = normalizeChromeClipParts(clipParts, quote);
+  let bodyHtml = '';
+  let textLength = 0;
+  let imageCount = 0;
+
+  for (const part of parts) {
+    if (part.type === 'text') {
+      const text = String(part.text || '').slice(0, Math.max(0, 20000 - textLength));
+      textLength += text.length;
+      bodyHtml += escapeHtmlAttr(text).replace(/\n/g, '<br>');
+      continue;
+    }
+    if (part.type === 'image') {
+      const image = imageMap.get(part.key);
+      if (!image) continue;
+      imageCount += 1;
+      bodyHtml += `<span class="note-web-excerpt-image" contenteditable="false"><img src="${escapeHtmlAttr(image.url)}" alt="${escapeHtmlAttr(image.alt || '网页图片')}" loading="lazy" referrerpolicy="no-referrer"></span>`;
+    }
+  }
+
+  if (!bodyHtml) {
+    const text = String(quote || '').replace(/\r\n?/g, '\n').slice(0, 20000);
+    bodyHtml = escapeHtmlAttr(text).replace(/\n/g, '<br>');
+  }
+
+  const kindLabel = imageCount ? `网页文字摘录 · ${imageCount} 张图片` : '网页文字摘录';
+  return `<section class="note-book-excerpt note-web-excerpt" contenteditable="false" data-note-atomic="1" data-web-url="${escapeHtmlAttr(url)}" data-web-title="${escapeHtmlAttr(title)}"><blockquote class="note-book-excerpt-text note-web-excerpt-text">${bodyHtml}</blockquote><div class="note-book-source note-web-source" contenteditable="false" data-note-readonly="1"><span class="note-book-source-meta">${escapeHtmlAttr(title)} · ${kindLabel}</span><a class="note-book-source-link" href="${escapeHtmlAttr(url)}" target="_blank" rel="noreferrer" data-web-open="1" contenteditable="false">打开网页 ↗</a></div></section>`;
 }
 
 function chromeCaptureMarkup({ imageUrl, pageTitle, pageUrl }) {
@@ -1647,7 +1721,7 @@ app.post('/api/notes/:id/upload', secureUpload.single('image'), (req, res) => {
 
 
 app.get('/api/integrations/chrome/status', (_req, res) => {
-  res.json({ ok: true, app: 'Note', integration: 'chrome', version: '1.9.1' });
+  res.json({ ok: true, app: 'Note', integration: 'chrome', version: '1.4.0' });
 });
 
 app.get('/api/integrations/chrome/targets', (req, res) => {
@@ -1671,23 +1745,96 @@ app.get('/api/integrations/chrome/targets', (req, res) => {
   });
 });
 
-app.post('/api/integrations/chrome/excerpt', (req, res) => {
+app.post('/api/integrations/chrome/excerpt', upload.array('images', 12), (req, res) => {
+  const files = Array.isArray(req.files) ? req.files : [];
+  let committed = false;
+
+  function cleanupFiles(keep = new Set()) {
+    for (const file of files) {
+      if (!file?.path || keep.has(file.filename)) continue;
+      try { if (fs.existsSync(file.path)) fs.unlinkSync(file.path); } catch {}
+    }
+  }
+
+  function fail(status, message) {
+    cleanupFiles();
+    return res.status(status).json({ error: message });
+  }
+
   try {
     const pageUrl = safeWebUrl(req.body.pageUrl);
-    if (!pageUrl) return res.status(400).json({ error: '网页地址无效' });
+    if (!pageUrl) return fail(400, '网页地址无效');
+
     const quote = String(req.body.quote || '').replace(/\r\n?/g, '\n').slice(0, 20000);
-    if (!quote.trim()) return res.status(400).json({ error: '摘录内容为空' });
     const pageTitle = webSourceTitle(req.body.pageTitle, pageUrl);
-    const markup = chromeExcerptMarkup({ pageTitle, pageUrl, quote });
+    const clipParts = normalizeChromeClipParts(req.body.clipParts, quote);
+
+    let rawImageMeta = [];
+    try {
+      const parsed = JSON.parse(String(req.body.imagesMeta || '[]'));
+      if (Array.isArray(parsed)) rawImageMeta = parsed.slice(0, 12);
+    } catch {}
+
+    const resolvedImages = [];
+
+    for (const meta of rawImageMeta) {
+      const key = String(meta?.key || '').trim().slice(0, 80);
+      if (!key) continue;
+
+      let imageUrl = '';
+      const localIndex = Math.floor(Number(meta?.localFileIndex));
+      if (Number.isFinite(localIndex) && localIndex >= 0 && localIndex < files.length) {
+        const file = files[localIndex];
+        if (file?.filename) {
+          imageUrl = `/uploads/${encodeURIComponent(file.filename)}`;
+        }
+      }
+      if (!imageUrl) imageUrl = safeWebImageUrl(meta?.src);
+      if (!imageUrl) continue;
+
+      resolvedImages.push({
+        key,
+        url: imageUrl,
+        alt: String(meta?.alt || '').replace(/\s+/g, ' ').trim().slice(0, 500)
+      });
+    }
+
+    const selectedImageKeys = new Set(
+      clipParts.filter(part => part.type === 'image').map(part => String(part.key || ''))
+    );
+    const usableImages = resolvedImages.filter(image => selectedImageKeys.has(image.key));
+    const usableLocalFileNames = new Set();
+    for (const image of usableImages) {
+      const match = /^\/uploads\/([^/?#]+)/.exec(image.url);
+      if (!match) continue;
+      try { usableLocalFileNames.add(decodeURIComponent(match[1])); } catch {}
+    }
+
+    const hasText = clipParts.some(part => part.type === 'text' && String(part.text || '').trim());
+    if (!hasText && !usableImages.length) return fail(400, '摘录内容为空');
+
+    const markup = chromeExcerptMarkup({
+      pageTitle,
+      pageUrl,
+      quote,
+      clipParts,
+      images: usableImages
+    });
+
     const notes = readNotes();
     const targetId = String(req.body.noteId || '').trim();
     let note;
+
     if (targetId) {
       const index = notes.findIndex(item => item.id === targetId);
-      if (index < 0) return res.status(404).json({ error: '目标笔记不存在' });
+      if (index < 0) return fail(404, '目标笔记不存在');
       const previous = notes[index];
-      if (previous.locked) return res.status(423).json({ error: '目标笔记已上锁，请先在 Note 中解锁' });
-      note = normalizeNote({ title: previous.title, type: previous.type, content: appendCaptureMarkup(previous, markup) }, previous);
+      if (previous.locked) return fail(423, '目标笔记已上锁，请先在 Note 中解锁');
+      note = normalizeNote({
+        title: previous.title,
+        type: previous.type,
+        content: appendCaptureMarkup(previous, markup)
+      }, previous);
       notes[index] = note;
     } else {
       const title = String(req.body.newTitle || '').trim().slice(0, 160) || `${pageTitle} · 网页摘录`;
@@ -1699,14 +1846,25 @@ app.post('/api/integrations/chrome/excerpt', (req, res) => {
       });
       notes.push(note);
     }
+
     writeNotes(notes);
+    committed = true;
+
+    // Any downloaded image that was not actually referenced by the final clip
+    // is immediately removed so the uploads directory does not accumulate junk.
+    cleanupFiles(usableLocalFileNames);
+
     broadcastNoteEvent({
       action: 'chrome-excerpt', noteId: note.id, note: noteMeta(note),
       sourceClientId: requestClientId(req), source: 'chrome', contentAppend: markup,
-      web: { pageUrl, pageTitle, kind: 'excerpt' }
+      web: { pageUrl, pageTitle, kind: 'excerpt', imageCount: usableImages.length }
     });
-    res.status(targetId ? 200 : 201).json({ note: noteMeta(note), source: { pageUrl, pageTitle, kind: 'excerpt' } });
+    res.status(targetId ? 200 : 201).json({
+      note: noteMeta(note),
+      source: { pageUrl, pageTitle, kind: 'excerpt', imageCount: usableImages.length }
+    });
   } catch (error) {
+    if (!committed) cleanupFiles();
     res.status(500).json({ error: error.message || '写入网页摘录失败' });
   }
 });
